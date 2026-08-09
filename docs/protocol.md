@@ -36,7 +36,10 @@ release across the three repos; removing or renaming one does.
 | `upNextSeconds` | number | `20` — how long before the end the up-next card appears. |
 
 **`episodes[]`** entries are deliberately short-keyed, because the whole list travels in every
-LOAD: `{ id, s, e, t }` — id, season number, episode number, title.
+LOAD: `{ id, sid, s, e, t }` — id, season id, season number, episode number, title. `sid` is what
+lets the receiver keep `seasonId` correct when it crosses a season boundary on its own;
+streamio-app sends it, `buildCastCustomData()` in watch.js currently does not (the receiver then
+keeps the season id it already had).
 
 **`subtitles[]`** entries accept `{ label, lang, url | file | src, default | initialDefault }`.
 Each URL is wrapped through `castProxyBase` before being handed to CAF.

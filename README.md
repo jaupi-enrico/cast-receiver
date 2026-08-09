@@ -65,16 +65,22 @@ stale JS against freshly fetched HTML.
 
 ## Deploying
 
-Push to the default branch; Vercel builds nothing and serves `index.html` at `/`
-(`/receiver` also works, via a rewrite in `vercel.json`).
+Push to `main`; Vercel builds nothing and serves `index.html` at `/` (`/receiver` also works, via
+a rewrite in `vercel.json`).
+
+**The URL registered in the Cast console must be the production alias**,
+`https://cast-receiver-enrico08.vercel.app/` — *not* the per-deployment
+`cast-receiver-<hash>-enrico08.vercel.app`, which changes on every push and would point the app id
+at a build that is about to go stale.
 
 Two settings that are not optional:
 
 - **`Cache-Control: no-store`** on everything — set in `vercel.json`. Chromecasts cache receiver
   HTML aggressively enough to hide a build you just deployed and cost you a day of debugging.
-- **Deployment Protection must be off** for the production deployment. With Vercel's SSO enabled
-  the Chromecast receives a login page instead of the receiver, and the failure looks exactly like
-  "casting does nothing".
+- **Deployment Protection must be off.** It is on by default on new projects, and with Vercel's
+  SSO enabled the Chromecast gets a 302 to `vercel.com/sso-api` instead of the receiver — a
+  failure that looks exactly like "casting does nothing". Settings → Deployment Protection →
+  Vercel Authentication → Disabled.
 
 ## Registering your own receiver
 
