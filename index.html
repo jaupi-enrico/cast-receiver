@@ -1,0 +1,1860 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Streamio Cast Receiver</title>
+
+    <!--
+      Streamio CAF Web Receiver (v3)
+      ────────────────────────────────────────────────────────────────
+      Registered as custom receiver app "BF64D6B2" in the Google Cast
+      console, pointed at this file's static deployment. Both senders
+      target that id: the browser one (`public/scripts/watch.js` in the
+      streamio-website repo) and the Flutter one (`lib/core/cast/` in
+      streamio-app). Bare paths in the comments below (`watch.js`,
+      `routes/content.router.ts`, …) are files in streamio-website.
+
+      This page is served as a plain static file (Vercel) with
+      `Cache-Control: no-store` — see vercel.json. It knows nothing about
+      any particular Streamio install: the backend to talk to arrives per
+      cast, in `customData.apiBase` / `.castProxyBase`. One deployment
+      therefore serves every install, and with neither field it still
+      plays whatever URL it was handed (rung 1 of the ladder in [4]).
+
+      Why a custom CAF receiver instead of the Default Media Receiver:
+        • Streamio's HLS (vixcloud) uses demuxed/multi-rendition manifests
+          with separate audio tracks. The Default Media Receiver mishandles
+          those; the CAF receiver hands playback to the Chromecast's native
+          media pipeline, which plays them correctly.
+        • loadMedia arrives with a proxied URL that carries no file extension,
+          so we force the HLS content-type in the LOAD interceptor below.
+
+      What this receiver does beyond playing a URL:
+        • Renders its own UI (idle / loading / playing / paused / up-next /
+          error) on an overlay above <cast-media-player>. The built-in CAF
+          chrome still exists underneath but is never seen.
+        • Reads a `customData` contract from the sender (see [4]) carrying the
+          show/episode/provider ids, artwork and the episode list.
+        • Advances to the next episode BY ITSELF — resolving servers and the
+          stream URL against the public API — so autoplay keeps working after
+          the sender's browser tab is closed.
+        • Re-resolves the stream after an expiry/segment error and resumes at
+          the same position, instead of dying on a black screen.
+
+      Everything degrades: with no customData at all this behaves exactly like
+      the old receiver plus a nicer skin.
+    -->
+    <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+
+    <style>
+      /* ⚠️ KEEP THIS CSS CHROME-70 COMPATIBLE (1st/2nd-gen Chromecast).
+         Banned: `gap` inside flex containers (Chrome 84), the `inset`
+         shorthand (87), aspect-ratio (88), :is()/:where() (88), clamp()/
+         min()/max() (79), backdrop-filter (76), logical properties (87).
+         Use margins for spacing and top/right/bottom/left for positioning. */
+
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      html, body {
+        width: 100%; height: 100%;
+        background: #000; color: #fff; overflow: hidden;
+        font-family: "Helvetica Neue", Arial, sans-serif;
+      }
+
+      /* The media surface. Its own controls/metadata render underneath #ui and
+         are never visible; the vars just stop anything flashing through during
+         transitions. */
+      cast-media-player {
+        --progress-color: #e50914;
+        --splash-image: none;
+        --background-color: #000;
+        --theme-hue: 0;
+        width: 100%; height: 100%; display: block;
+      }
+
+      /* ─── Overlay root ────────────────────────────────────────────────
+         Transparent and non-interactive; CAF renders sideloaded captions
+         inside the media element region, so this must never be opaque
+         while playing or it would swallow them. */
+      #ui {
+        position: fixed;
+        top: 0; right: 0; bottom: 0; left: 0;
+        z-index: 10;
+        pointer-events: none;
+      }
+      /* Smart displays (Nest Hub) have their own touch controls underneath —
+         don't cover them. */
+      #ui.touch { display: none; }
+
+      .layer {
+        position: absolute;
+        top: 0; right: 0; bottom: 0; left: 0;
+        opacity: 0;
+        transition: opacity 0.35s ease;
+      }
+      .layer.on { opacity: 1; }
+
+      /* ─── Backdrop ─────────────────────────────────────────────────── */
+      #l-backdrop { background: #000; }
+      #bd-img {
+        width: 100%; height: 100%;
+        object-fit: cover;
+        opacity: 0.35;
+      }
+      #bd-scrim {
+        position: absolute;
+        top: 0; right: 0; bottom: 0; left: 0;
+        background: linear-gradient(
+          to top,
+          rgba(0, 0, 0, 0.95) 0%,
+          rgba(0, 0, 0, 0.75) 35%,
+          rgba(0, 0, 0, 0.45) 100%
+        );
+      }
+
+      /* ─── Idle ─────────────────────────────────────────────────────── */
+      #l-idle {
+        display: flex; flex-direction: column;
+        align-items: center; justify-content: center;
+      }
+      #brand {
+        font: 700 30px/1 "Helvetica Neue", Arial, sans-serif;
+        letter-spacing: 3px;
+        text-transform: uppercase;
+        color: rgba(255, 255, 255, 0.22);
+      }
+      #idle-hint {
+        margin-top: 14px;
+        font-size: 15px;
+        color: rgba(255, 255, 255, 0.35);
+      }
+
+      .spinner {
+        width: 64px; height: 64px;
+        border: 4px solid rgba(255, 255, 255, 0.15);
+        border-top-color: #e50914;
+        border-radius: 50%;
+        animation: spin 0.9s linear infinite;
+        margin-bottom: 26px;
+      }
+      @keyframes spin { to { transform: rotate(360deg); } }
+
+      /* ─── Metadata (loading / resolving / paused) ──────────────────── */
+      #l-meta {
+        display: flex;
+        align-items: flex-end;
+        padding: 0 70px 130px 70px;
+      }
+      #m-poster {
+        width: 200px;
+        border-radius: 6px;
+        display: none;
+        margin-right: 34px;
+        box-shadow: 0 10px 34px rgba(0, 0, 0, 0.7);
+      }
+      #m-text { max-width: 62%; }
+      #m-kicker {
+        font-size: 15px;
+        letter-spacing: 2px;
+        text-transform: uppercase;
+        color: #e50914;
+        margin-bottom: 10px;
+        min-height: 18px;
+      }
+      #m-title {
+        font-size: 46px;
+        font-weight: 700;
+        line-height: 1.1;
+      }
+      #m-sub {
+        font-size: 22px;
+        color: rgba(255, 255, 255, 0.8);
+        margin-top: 10px;
+      }
+      #m-desc {
+        font-size: 17px;
+        line-height: 1.5;
+        color: rgba(255, 255, 255, 0.6);
+        margin-top: 16px;
+        max-height: 78px;
+        overflow: hidden;
+        /* -webkit-line-clamp is ancient in Chrome (long predates 70) and adds
+           the ellipsis, so an overview doesn't stop dead mid-word. max-height
+           above stays as the fallback if the clamp is ever ignored. */
+        display: -webkit-box;
+        -webkit-line-clamp: 3;
+        -webkit-box-orient: vertical;
+      }
+      #m-spin {
+        width: 34px; height: 34px;
+        border: 3px solid rgba(255, 255, 255, 0.15);
+        border-top-color: #e50914;
+        border-radius: 50%;
+        animation: spin 0.9s linear infinite;
+        margin-top: 20px;
+        display: none;
+      }
+
+      /* ─── Progress bar (paused + transient) ────────────────────────── */
+      #l-bar {
+        display: flex;
+        flex-direction: column;
+        justify-content: flex-end;
+        padding: 0 70px 60px 70px;
+      }
+      #b-track {
+        height: 6px;
+        border-radius: 3px;
+        background: rgba(255, 255, 255, 0.22);
+        overflow: hidden;
+      }
+      #b-fill {
+        height: 100%;
+        width: 0%;
+        background: #e50914;
+      }
+      #b-times {
+        display: flex;
+        justify-content: space-between;
+        margin-top: 10px;
+        font-size: 16px;
+        color: rgba(255, 255, 255, 0.75);
+      }
+
+      /* ─── Up next ──────────────────────────────────────────────────── */
+      #l-upnext {
+        display: flex;
+        align-items: flex-end;
+        justify-content: flex-end;
+        padding: 0 70px 70px 70px;
+      }
+      #un-card {
+        width: 430px;
+        background: rgba(12, 12, 12, 0.94);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 8px;
+        padding: 20px 22px;
+        box-shadow: 0 14px 40px rgba(0, 0, 0, 0.65);
+      }
+      #un-kicker {
+        font-size: 13px;
+        letter-spacing: 2px;
+        text-transform: uppercase;
+        color: rgba(255, 255, 255, 0.5);
+      }
+      #un-label {
+        font-size: 15px;
+        color: #e50914;
+        margin-top: 8px;
+        font-weight: 700;
+      }
+      #un-title {
+        font-size: 22px;
+        font-weight: 700;
+        margin-top: 4px;
+        overflow: hidden;
+        max-height: 58px;
+      }
+      #un-count {
+        font-size: 15px;
+        color: rgba(255, 255, 255, 0.6);
+        margin-top: 12px;
+      }
+      #un-track {
+        height: 4px;
+        border-radius: 2px;
+        background: rgba(255, 255, 255, 0.18);
+        margin-top: 10px;
+        overflow: hidden;
+      }
+      #un-fill {
+        height: 100%; width: 100%;
+        background: #e50914;
+        transition: width 0.5s linear;
+      }
+
+      /* ─── Error ────────────────────────────────────────────────────── */
+      #l-error {
+        display: flex; flex-direction: column;
+        align-items: center; justify-content: center;
+        background: rgba(0, 0, 0, 0.88);
+        padding: 0 90px;
+        text-align: center;
+      }
+      #e-rule {
+        width: 64px; height: 4px;
+        background: #e50914;
+        border-radius: 2px;
+        margin-bottom: 26px;
+      }
+      #e-msg { font-size: 30px; font-weight: 700; line-height: 1.25; }
+      #e-hint {
+        font-size: 18px;
+        color: rgba(255, 255, 255, 0.6);
+        margin-top: 14px;
+      }
+      #e-code {
+        font: 13px/1 "Courier New", monospace;
+        color: rgba(255, 255, 255, 0.3);
+        margin-top: 22px;
+        letter-spacing: 1px;
+      }
+
+      /* ─── Toast ────────────────────────────────────────────────────── */
+      #l-toast {
+        display: flex;
+        align-items: flex-start;
+        justify-content: center;
+        padding-top: 48px;
+      }
+      #t-text {
+        background: rgba(12, 12, 12, 0.92);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 22px;
+        padding: 10px 22px;
+        font-size: 16px;
+        color: rgba(255, 255, 255, 0.85);
+      }
+
+      /* ─── Phase → layer visibility (the whole UI state machine) ─────
+         One data-phase attribute drives everything; no imperative
+         show/hide anywhere in the script. */
+      #ui[data-phase="IDLE"] #l-idle,
+      #ui[data-phase="IDLE"] #l-backdrop,
+
+      #ui[data-phase="RESOLVING"] #l-backdrop,
+      #ui[data-phase="RESOLVING"] #l-meta,
+
+      #ui[data-phase="LOADING"] #l-backdrop,
+      #ui[data-phase="LOADING"] #l-meta,
+
+      #ui[data-phase="RECOVERING"] #l-backdrop,
+      #ui[data-phase="RECOVERING"] #l-meta,
+
+      #ui[data-phase="PAUSED"] #l-backdrop,
+      #ui[data-phase="PAUSED"] #l-meta,
+      #ui[data-phase="PAUSED"] #l-bar,
+
+      #ui[data-phase="UPNEXT"] #l-upnext,
+
+      #ui[data-phase="ERROR"] #l-error {
+        opacity: 1;
+      }
+
+      /* PLAYING shows nothing at all, except the 4s transient info bar. */
+      #ui[data-bar="1"] #l-bar { opacity: 1; }
+      #ui[data-toast="1"] #l-toast { opacity: 1; }
+
+      /* PAUSED originally hid the backdrop so the frozen video frame would
+         show through — but #l-backdrop is an opaque black layer, so the frame
+         was covered anyway and the result was a flat black screen with no
+         artwork and no video. Show the backdrop on pause like every other
+         phase instead. */
+    </style>
+  </head>
+  <body>
+    <cast-media-player></cast-media-player>
+
+    <div id="ui" data-phase="IDLE">
+      <div class="layer" id="l-backdrop">
+        <img id="bd-img" alt="" />
+        <div id="bd-scrim"></div>
+      </div>
+
+      <div class="layer" id="l-idle">
+        <div class="spinner"></div>
+        <div id="brand">Streamio</div>
+        <div id="idle-hint">Ready to cast</div>
+      </div>
+
+      <div class="layer" id="l-meta">
+        <img id="m-poster" alt="" />
+        <div id="m-text">
+          <div id="m-kicker"></div>
+          <div id="m-title"></div>
+          <div id="m-sub"></div>
+          <div id="m-desc"></div>
+          <div id="m-spin"></div>
+        </div>
+      </div>
+
+      <div class="layer" id="l-bar">
+        <div id="b-track"><div id="b-fill"></div></div>
+        <div id="b-times">
+          <span id="b-elapsed">0:00</span>
+          <span id="b-duration">0:00</span>
+        </div>
+      </div>
+
+      <div class="layer" id="l-upnext">
+        <div id="un-card">
+          <div id="un-kicker">Up next</div>
+          <div id="un-label"></div>
+          <div id="un-title"></div>
+          <div id="un-count"></div>
+          <div id="un-track"><div id="un-fill"></div></div>
+        </div>
+      </div>
+
+      <div class="layer" id="l-error">
+        <div id="e-rule"></div>
+        <div id="e-msg"></div>
+        <div id="e-hint"></div>
+        <div id="e-code"></div>
+      </div>
+
+      <div class="layer" id="l-toast"><div id="t-text"></div></div>
+    </div>
+
+    <script>
+      // ⚠️ KEEP THIS SCRIPT ES2018-COMPATIBLE. 1st/2nd-gen Chromecasts run
+      // Chrome 70 (CrKey/1.36), which does NOT support optional chaining (?.)
+      // or nullish coalescing (??) — those are Chrome 80+. Using them here is a
+      // hard parse error on those devices: the receiver HTML loads but the
+      // script never runs, so casting silently does nothing. Use `a && a.b`,
+      // or the get() helper in [2].
+      //
+      // Also banned: Object.fromEntries (73), String.matchAll (73),
+      // Promise.allSettled (76), replaceAll (85), Array.at (92), logical
+      // assignment operators, class fields, top-level await.
+
+      // ═══ [0] CONSTANTS ═══════════════════════════════════════════════
+      // No backend is baked in: this file is a static deployment shared by
+      // every Streamio install, and the one to talk to arrives per cast in
+      // customData (ctx.apiBase / ctx.castProxyBase, see [4]). Until a LOAD
+      // supplies them there is no API to call and no log endpoint to post
+      // to — which is a supported state, not a broken one.
+      var NS = "urn:x-cast:com.streamio.control";
+
+      var TICK_MS = 500;
+      var STATE_BROADCAST_MS = 5000;
+      var BAR_TRANSIENT_MS = 4000;
+      var TOAST_MS = 4000;
+      var MAX_RECOVER_ATTEMPTS = 3;
+      var RECOVER_BACKOFF = [0, 2000, 5000];
+      var RECOVER_RESET_AFTER_MS = 10000;
+      var MAX_SEASON_SCAN = 20;
+      var MAX_EPISODES = 500;
+      var FETCH_TIMEOUT_MS = 8000;
+
+      var cf = cast.framework;
+      var messages = cf.messages;
+      var context = cf.CastReceiverContext.getInstance();
+      var player = context.getPlayerManager();
+
+      // ═══ [1] REMOTE LOGGING ══════════════════════════════════════════
+      // Chromecast has no visible console, so mirror key events to the
+      // server (`[CAST-RECEIVER]` lines in the streamio container logs).
+      // This is the primary way to diagnose "connects but won't play".
+      //
+      // The endpoint is not known at boot — it lives on ctx.apiBase, which
+      // only arrives with the first LOAD. Everything logged before that is
+      // buffered and flushed by flushLogBuffer() once a base is known:
+      // those early lines (SDK start, sender connect, the LOAD itself) are
+      // exactly the ones worth having when nothing plays. The buffer is
+      // capped so a receiver that never gets an apiBase can't grow it
+      // without bound.
+      var LOG_BUFFER_MAX = 50;
+      var logBuffer = [];
+
+      function postLog(base, ts, msg) {
+        try {
+          var url = new URL(base + "/api/cast-log");
+          url.searchParams.set("ts", ts);
+          url.searchParams.set("msg", msg);
+          fetch(url.toString()).catch(function () {});
+        } catch {
+          /* a malformed apiBase must never break playback */
+        }
+      }
+
+      function flushLogBuffer() {
+        if (!ctx || !ctx.apiBase || !logBuffer.length) return;
+        var pending = logBuffer;
+        logBuffer = [];
+        for (var i = 0; i < pending.length; i++) {
+          postLog(ctx.apiBase, pending[i].ts, pending[i].msg);
+        }
+      }
+
+      function rlog() {
+        var parts = [];
+        for (var i = 0; i < arguments.length; i++) {
+          var a = arguments[i];
+          try {
+            parts.push(typeof a === "object" ? JSON.stringify(a) : String(a));
+          } catch {
+            parts.push("[unserializable]");
+          }
+        }
+        var msg = parts.join(" ");
+        if (msg.length > 900) msg = msg.slice(0, 900) + "…";
+
+        console.log(msg);
+
+        var ts = new Date().toISOString();
+        // `ctx` is declared in [4], below this block — it is undefined for
+        // the duration of parsing but always assigned before anything can
+        // call rlog(), so guard on it rather than assuming.
+        if (ctx && ctx.apiBase) {
+          postLog(ctx.apiBase, ts, msg);
+          return;
+        }
+        if (logBuffer.length < LOG_BUFFER_MAX) {
+          logBuffer.push({ ts: ts, msg: msg });
+        }
+      }
+
+      // Throttled variant, so the 500ms ticker can log without flooding the
+      // container logs (and the tunnel) with one GET every half second.
+      var throttleAt = {};
+      function rlogThrottled(key, ms) {
+        var now = Date.now();
+        if (throttleAt[key] && now - throttleAt[key] < ms) return;
+        throttleAt[key] = now;
+        rlog.apply(null, Array.prototype.slice.call(arguments, 2));
+      }
+
+      // CAF reports any uncaught exception in receiver code as a player ERROR
+      // with detailedErrorCode 900 (APP) and an empty reason — which reads
+      // exactly like a stream failure and names neither file nor line. Catch
+      // them here first so the log says what actually broke.
+      window.addEventListener("error", function (e) {
+        rlogThrottled(
+          "winerr",
+          5000,
+          "[R][js] uncaught:",
+          String((e && e.message) || "?"),
+          (e && e.filename ? String(e.filename) : "") +
+            ":" + String((e && e.lineno) || 0)
+        );
+      });
+      window.addEventListener("unhandledrejection", function (e) {
+        var r = e && e.reason;
+        rlogThrottled(
+          "winrej",
+          5000,
+          "[R][js] unhandled rejection:",
+          String((r && (r.stack || r.message)) || r || "?")
+        );
+      });
+
+      // Stream URLs are long and carry upstream tokens — never log them whole.
+      function safeUrl(u) {
+        try {
+          var p = new URL(u);
+          return p.hostname + "/…" + p.pathname.slice(-32);
+        } catch {
+          return "(unparseable)";
+        }
+      }
+
+      // ═══ [2] ES2018-SAFE HELPERS ═════════════════════════════════════
+      function get(o, k, d) {
+        return o && o[k] !== undefined && o[k] !== null ? o[k] : d;
+      }
+      function str(v, d) {
+        return typeof v === "string" && v ? v : d || "";
+      }
+      function num(v, d) {
+        var n = Number(v);
+        return isFinite(n) ? n : d;
+      }
+      function clockTime(seconds) {
+        var s = Math.max(0, Math.floor(num(seconds, 0)));
+        var h = Math.floor(s / 3600);
+        var m = Math.floor((s % 3600) / 60);
+        var sec = s % 60;
+        var mm = h > 0 && m < 10 ? "0" + m : String(m);
+        var ss = sec < 10 ? "0" + sec : String(sec);
+        return (h > 0 ? h + ":" : "") + mm + ":" + ss;
+      }
+
+      // ═══ [3] DOM + PHASE ═════════════════════════════════════════════
+      var el = {};
+      [
+        "ui", "bd-img", "m-poster", "m-kicker", "m-title", "m-sub", "m-desc",
+        "m-spin", "b-fill", "b-elapsed", "b-duration", "un-label", "un-title",
+        "un-count", "un-fill", "e-msg", "e-hint", "e-code", "t-text",
+        "idle-hint"
+      ].forEach(function (id) {
+        el[id] = document.getElementById(id);
+      });
+
+      var phase = "IDLE";
+      function setPhase(next) {
+        if (phase === next) return;
+        rlog("[R][ui] phase " + phase + "→" + next);
+        phase = next;
+        el.ui.setAttribute("data-phase", next);
+        el["m-spin"].style.display =
+          next === "RESOLVING" || next === "LOADING" || next === "RECOVERING"
+            ? "block"
+            : "none";
+        broadcastState();
+      }
+
+      // The info bar is shown persistently only in PAUSED; everywhere else it
+      // is a 4s transient, so it doesn't sit on top of CAF's captions (which
+      // render in the same lower third and cannot be repositioned).
+      var barTimer = null;
+      function flashBar() {
+        el.ui.setAttribute("data-bar", "1");
+        if (barTimer) clearTimeout(barTimer);
+        barTimer = setTimeout(function () {
+          el.ui.removeAttribute("data-bar");
+        }, BAR_TRANSIENT_MS);
+      }
+
+      var toastTimer = null;
+      function toast(text) {
+        el["t-text"].textContent = text;
+        el.ui.setAttribute("data-toast", "1");
+        if (toastTimer) clearTimeout(toastTimer);
+        toastTimer = setTimeout(function () {
+          el.ui.removeAttribute("data-toast");
+        }, TOAST_MS);
+      }
+
+      function setImage(node, url) {
+        if (url) {
+          if (node.getAttribute("src") !== url) node.setAttribute("src", url);
+          // Must be an explicit value: these nodes are `display:none` in the
+          // stylesheet, and "" only clears the inline style, which falls right
+          // back to the stylesheet's none — i.e. the image never appears.
+          node.style.display = "block";
+        } else {
+          node.removeAttribute("src");
+          node.style.display = "none";
+        }
+      }
+
+      // Repaints the metadata layer from ctx. Reuses the same nodes/images —
+      // never rebuilds DOM, which matters on a 512MB device.
+      function renderMeta(kicker) {
+        el["m-kicker"].textContent = kicker || "";
+        el["m-title"].textContent = ctx.showTitle || "Streamio";
+        var sub = "";
+        if (ctx.episodeLabel || ctx.episodeTitle) {
+          sub = [ctx.episodeLabel, ctx.episodeTitle]
+            .filter(function (x) { return !!x; })
+            .join(" · ");
+        }
+        el["m-sub"].textContent = sub;
+        el["m-desc"].textContent = ctx.description || "";
+        setImage(el["m-poster"], ctx.poster);
+        setImage(el["bd-img"], ctx.backdrop || ctx.poster);
+      }
+
+      function showError(message, hint, code) {
+        el["e-msg"].textContent = message;
+        el["e-hint"].textContent = hint || "";
+        el["e-code"].textContent = code ? "code " + code : "";
+        setPhase("ERROR");
+        broadcast({
+          type: "ERROR",
+          code: code || null,
+          message: message,
+          recoverable: false
+        });
+      }
+
+      // ═══ [4] SESSION CONTEXT (the customData contract, v1) ════════════
+      // Everything here is optional. The degradation ladder:
+      //   1. no customData at all  → title/poster from MediaInformation
+      //      .metadata, no autoplay-next, no re-resolve (= the old receiver).
+      //   2. no `episodes`         → we fetch the list ourselves ([8]).
+      //   3. no showId/provider    → metadata renders, queue+recovery off.
+      //   4. contentType "movie"   → no up-next; recovery still works.
+      // Both senders send the full shape today, but rung 1 stays a live code
+      // path: an older app build still installed on someone's phone sends
+      // less (or nothing), and it must keep playing rather than error out.
+      // The contract is written down in docs/protocol.md — this file is its
+      // canonical consumer, so that doc lives in this repo.
+      var ctx = null;
+      function blankCtx() {
+        return {
+          v: 0,
+          // Empty until a sender supplies them. Everything that needs a
+          // backend is gated on apiBase (canResolve(), rlog()), so empty
+          // means rung 1, not a broken receiver.
+          apiBase: "",
+          castProxyBase: "",
+          provider: "",
+          contentType: "episode",
+          showId: "",
+          showTitle: "",
+          description: "",
+          poster: "",
+          backdrop: "",
+          seasonId: "",
+          seasonNumber: null,
+          episodeId: "",
+          episodeNumber: null,
+          episodeTitle: "",
+          episodeLabel: "",
+          durationSeconds: null,
+          serverName: "",
+          serverIndex: 0,
+          subtitles: [],
+          episodes: [],
+          episodeIndex: -1,
+          autoplayNext: true,
+          upNextSeconds: 20
+        };
+      }
+      ctx = blankCtx();
+
+      function applyCustomData(cd, media) {
+        var c = blankCtx();
+
+        if (cd && typeof cd === "object") {
+          c.v = num(cd.v, 1);
+          c.apiBase = str(cd.apiBase, "").replace(/\/+$/, "");
+          c.castProxyBase = str(cd.castProxyBase, "");
+          // A sender that sends apiBase but not castProxyBase gets the
+          // conventional prefix derived from it. It must match
+          // CAST_PROXY_PREFIX in the backend's content.router.ts character
+          // for character — see [6].
+          if (!c.castProxyBase && c.apiBase) {
+            c.castProxyBase = c.apiBase + "/api/cast-proxy?url=";
+          }
+          c.provider = str(cd.provider, "");
+          c.contentType = cd.contentType === "movie" ? "movie" : "episode";
+          c.showId = str(cd.showId, "");
+          c.showTitle = str(cd.showTitle, "");
+          c.description = str(cd.description, "");
+          c.poster = str(cd.poster, "");
+          c.backdrop = str(cd.backdrop, "");
+          c.seasonId = str(cd.seasonId, "");
+          c.seasonNumber = num(cd.seasonNumber, null);
+          c.episodeId = str(cd.episodeId, "");
+          c.episodeNumber = num(cd.episodeNumber, null);
+          c.episodeTitle = str(cd.episodeTitle, "");
+          c.episodeLabel = str(cd.episodeLabel, "");
+          c.durationSeconds = num(cd.durationSeconds, null);
+          c.serverName = str(cd.serverName, "");
+          c.serverIndex = num(cd.serverIndex, 0);
+          c.autoplayNext = cd.autoplayNext !== false;
+          c.upNextSeconds = num(cd.upNextSeconds, 20);
+          if (Array.isArray(cd.subtitles)) c.subtitles = cd.subtitles;
+          if (Array.isArray(cd.episodes)) {
+            c.episodes = cd.episodes.slice(0, MAX_EPISODES);
+            c.episodeIndex = num(cd.episodeIndex, -1);
+            if (c.episodeIndex < 0 && c.episodeId) {
+              c.episodeIndex = indexOfEpisode(c.episodes, c.episodeId);
+            }
+          }
+        }
+
+        // Rung 1: fall back to whatever the media metadata carries.
+        var md = media && media.metadata;
+        if (!c.showTitle && md) {
+          c.showTitle = str(md.seriesTitle, "") || str(md.title, "Streamio");
+          if (md.seriesTitle && md.title) c.episodeTitle = str(md.title, "");
+          if (!c.episodeLabel && md.season && md.episode) {
+            c.episodeLabel = "S" + md.season + "E" + md.episode;
+          }
+        }
+        if (!c.poster && md && Array.isArray(md.images) && md.images.length) {
+          c.poster = str(md.images[0].url, "");
+        }
+        if (!c.showTitle) c.showTitle = "Streamio";
+
+        ctx = c;
+        queueState = { loaded: c.episodes.length > 0, promise: null };
+
+        // First LOAD that carries an apiBase is also the first moment the
+        // buffered boot logs from [1] have somewhere to go.
+        flushLogBuffer();
+
+        rlog(
+          "[R][load]",
+          cd ? "cd v=" + c.v : "no customData — legacy mode",
+          "provider=" + (c.provider || "-"),
+          "show=" + (c.showId || "-"),
+          "ep=" + (c.episodeLabel || c.episodeId || "-"),
+          "type=" + c.contentType,
+          "subs=" + c.subtitles.length,
+          "queue=" + c.episodes.length,
+          "idx=" + c.episodeIndex,
+          // Autoplay-next and recovery both hang off this; log it so a session
+          // that silently can't do either says so at load rather than at the
+          // end of the episode, where nothing happening looks like a bug.
+          "resolve=" + (canResolve() ? "yes" : "no")
+        );
+      }
+
+      function indexOfEpisode(list, id) {
+        for (var i = 0; i < list.length; i++) {
+          if (String(get(list[i], "id", "")) === String(id)) return i;
+        }
+        return -1;
+      }
+
+      // Can this receiver resolve streams on its own? (Needs an API base and
+      // something to resolve against.)
+      //
+      // The provider is deliberately *not* required: the content routes fall
+      // back to the default provider when the param is absent, exactly as the
+      // web player does when nothing is stored locally. Demanding it here cost
+      // both autoplay-next and expired-URL recovery on any cast started from a
+      // browser that had never explicitly picked a source — and the symptom
+      // was silence, since neither feature announces that it turned itself off.
+      function canResolve() {
+        return !!(ctx.apiBase && (ctx.episodeId || ctx.showId));
+      }
+
+      // ═══ [5] API CLIENT ══════════════════════════════════════════════
+      // The /api content routes run under optionalAuth with CORS *, so the
+      // receiver can call them with no token. The cost is that it sees the
+      // strictest 18+ filtering: adult titles and adult providers answer 403,
+      // which is terminal, not retryable.
+      function fetchJson(url, opts) {
+        var options = opts || {};
+        var controller =
+          typeof AbortController !== "undefined" ? new AbortController() : null;
+        if (controller) options.signal = controller.signal;
+
+        var timer = setTimeout(function () {
+          if (controller) controller.abort();
+        }, FETCH_TIMEOUT_MS);
+
+        return fetch(url, options).then(
+          function (res) {
+            clearTimeout(timer);
+            if (res.status === 403) {
+              var e403 = new Error("forbidden");
+              e403.status = 403;
+              throw e403;
+            }
+            if (!res.ok) throw new Error("HTTP " + res.status);
+            return res.json();
+          },
+          function (err) {
+            clearTimeout(timer);
+            throw err;
+          }
+        );
+      }
+
+      // One retry on a network blip; never on a 403 (see above).
+      function fetchJsonRetry(url, opts) {
+        return fetchJson(url, opts).catch(function (err) {
+          if (err && err.status === 403) throw err;
+          return fetchJson(url, opts);
+        });
+      }
+
+      // An empty `provider=` is not the same as no param: send it only when we
+      // actually have one, and let the server pick its default otherwise.
+      function api(path) {
+        if (!ctx.provider) return ctx.apiBase + path;
+        var sep = path.indexOf("?") === -1 ? "?" : "&";
+        return (
+          ctx.apiBase + path + sep + "provider=" + encodeURIComponent(ctx.provider)
+        );
+      }
+
+      // ═══ [6] PROXY ═══════════════════════════════════════════════════
+      // Must match CAST_PROXY_PREFIX in routes/content.router.ts character for
+      // character — the receiver has no page origin, so a mismatch means the
+      // master manifest loads and every segment 404s.
+      function proxied(raw) {
+        // No base means no backend was ever supplied; hand back the URL
+        // untouched rather than building "https%3A%2F%2F…" and failing with
+        // an error that names nothing.
+        if (!ctx.castProxyBase) return raw;
+        return ctx.castProxyBase + encodeURIComponent(raw);
+      }
+
+      // ═══ [7] LOAD NORMALIZATION ══════════════════════════════════════
+      // Applied both to sender-initiated LOADs (via the interceptor) and to
+      // the requests this receiver builds itself, so the two can never drift.
+      var suppressHlsHints = false;
+
+      function normalizeLoad(loadRequestData) {
+        var media = loadRequestData.media;
+        if (!media) return loadRequestData;
+
+        var url = str(media.contentId, "") || str(media.contentUrl, "");
+        var type = str(media.contentType, "").toLowerCase();
+
+        // 1. Force the HLS content-type. The sender points at
+        //    /api/cast-proxy?url=... which has no file extension, so the
+        //    receiver can't infer the type on its own.
+        var looksHls =
+          type.indexOf("mpegurl") !== -1 ||
+          url.indexOf(".m3u8") !== -1 ||
+          url.indexOf("cast-proxy") !== -1 ||
+          url.indexOf("type=video") !== -1;
+
+        var looksProgressive = /\.(mp4|m4v|webm|mov)(\?|$)/i.test(url);
+
+        if (looksHls && !looksProgressive && type.indexOf("mpegurl") === -1) {
+          media.contentType = "application/x-mpegurl";
+        }
+
+        // 2. Declare the segment container formats explicitly.
+        //    Streamio's upstream (vixcloud) serves MPEG-2 TS segments.
+        //    For DEMUXED streams (StreamingCommunity: separate audio + video
+        //    renditions) CAF cannot auto-detect the format and rejects every
+        //    segment with error 315 (HLS_SEGMENT_PARSING) → 905 LOAD_FAILED
+        //    — "connects to the TV, video never plays". Muxed streams
+        //    (AnimeUnity) auto-detect fine, and these hints match them too,
+        //    so we set them by default.
+        //    They are dropped on a recovery retry: they're wrong for any
+        //    fMP4/CMAF source, and a 315 is exactly that symptom.
+        if (!looksProgressive && !suppressHlsHints) {
+          media.hlsSegmentFormat = messages.HlsSegmentFormat.TS;
+          media.hlsVideoSegmentFormat = messages.HlsVideoSegmentFormat.MPEG2_TS;
+        } else if (suppressHlsHints) {
+          delete media.hlsSegmentFormat;
+          delete media.hlsVideoSegmentFormat;
+        }
+
+        // Everything below this point is subtitles/metadata/styling — none of
+        // it is required to play a stream. It is wrapped because **a throw
+        // inside the LOAD interceptor is reported as error 905**: a missing
+        // enum in one CAF build would otherwise present as "casting is
+        // broken", with no clue that the cause was a caption colour.
+        try {
+          // 3. Subtitles. The sender normally builds the tracks itself; when
+          //    it doesn't (Flutter, or a load this receiver initiated) build
+          //    them from customData.subtitles instead.
+          if ((!media.tracks || !media.tracks.length) && ctx.subtitles.length) {
+            media.tracks = buildTracks(ctx.subtitles);
+            var def = defaultTrackId(ctx.subtitles);
+            if (def > 0 && !loadRequestData.activeTrackIds) {
+              loadRequestData.activeTrackIds = [def];
+            }
+          }
+
+          // 4. CAF renders captions itself — reimplementing WebVTT on Chrome
+          //    70 is a trap — but the default style is a grey box. Restyle it.
+          media.textTrackStyle = subtitleStyle();
+
+          // 5. Keep MediaInformation.metadata populated even though our own
+          //    DOM draws the UI: Google Assistant ("what's playing") and the
+          //    phone's media notification read this, not the DOM.
+          if (!media.metadata) media.metadata = buildMetadata();
+        } catch (e) {
+          rlog("[R][load] non-fatal decoration failed:", String(e && e.message));
+        }
+
+        rlog(
+          "[R][load] url=" + safeUrl(url),
+          "type=" + str(media.contentType, "(none)"),
+          "tracks=" + ((media.tracks && media.tracks.length) || 0),
+          "active=" + JSON.stringify(loadRequestData.activeTrackIds || []),
+          "hints=" + (suppressHlsHints ? "off" : "ts")
+        );
+
+        return loadRequestData;
+      }
+
+      function buildTracks(subs) {
+        var tracks = [];
+        for (var i = 0; i < subs.length; i++) {
+          var s = subs[i];
+          var srcUrl = str(s.url, "") || str(s.file, "") || str(s.src, "");
+          if (!srcUrl) continue;
+          // Track ids must be unique positive integers; 0 is not a valid
+          // activeTrackId.
+          var t = new messages.Track(tracks.length + 1, messages.TrackType.TEXT);
+          t.trackContentId = srcUrl;
+          t.trackContentType = "text/vtt";
+          t.subtype = messages.TextTrackType.SUBTITLES;
+          t.name = str(s.label, "") || str(s.lang, "") || "Subtitle " + (i + 1);
+          t.language = str(s.lang, "und");
+          tracks.push(t);
+        }
+        return tracks;
+      }
+
+      function defaultTrackId(subs) {
+        for (var i = 0; i < subs.length; i++) {
+          if (subs[i] && (subs[i].default || subs[i].initialDefault)) return i + 1;
+        }
+        return -1;
+      }
+
+      // Enum names are not stable across CAF builds — the generic-family enum
+      // is `TextTrackFontGenericFamily` on some and `FontGenericFamily` on
+      // others, and reading a member off the missing one throws. Anything
+      // touched here is cosmetic, so resolve it defensively and let it be
+      // undefined rather than take playback down with it.
+      function enumMember(names, key) {
+        for (var i = 0; i < names.length; i++) {
+          var e = messages[names[i]];
+          if (e && e[key] !== undefined) return e[key];
+        }
+        return undefined;
+      }
+
+      function subtitleStyle() {
+        var ts = new messages.TextTrackStyle();
+        ts.foregroundColor = "#FFFFFFFF";
+        ts.backgroundColor = "#00000000"; // no box; outline does the contrast
+        ts.edgeColor = "#000000FF";
+        ts.fontScale = 1.1;
+        ts.fontFamily = "sans-serif";
+
+        var edge = enumMember(["TextTrackEdgeType"], "OUTLINE");
+        if (edge !== undefined) ts.edgeType = edge;
+
+        var family = enumMember(
+          ["TextTrackFontGenericFamily", "FontGenericFamily"],
+          "SANS_SERIF"
+        );
+        if (family !== undefined) ts.fontGenericFamily = family;
+
+        return ts;
+      }
+
+      function buildMetadata() {
+        var images = [];
+        if (ctx.poster) images.push(new messages.Image(ctx.poster));
+        else if (ctx.backdrop) images.push(new messages.Image(ctx.backdrop));
+
+        if (ctx.contentType === "episode" && ctx.showTitle) {
+          var tv = new messages.TvShowMediaMetadata();
+          tv.seriesTitle = ctx.showTitle;
+          tv.title = ctx.episodeTitle || ctx.episodeLabel || ctx.showTitle;
+          if (ctx.seasonNumber !== null) tv.season = ctx.seasonNumber;
+          if (ctx.episodeNumber !== null) tv.episode = ctx.episodeNumber;
+          if (images.length) tv.images = images;
+          return tv;
+        }
+
+        var mv = new messages.MovieMediaMetadata();
+        mv.title = ctx.showTitle;
+        if (ctx.description) mv.subtitle = ctx.description.slice(0, 120);
+        if (images.length) mv.images = images;
+        return mv;
+      }
+
+      // Set while this receiver issues its own load (next episode, recovery).
+      // Whether CAF routes PlayerManager.load() back through this interceptor
+      // is version-dependent; if it does, re-running applyCustomData on a
+      // request that carries no customData would wipe the session context
+      // mid-recovery. The request is already normalized either way.
+      var selfInitiatedLoad = false;
+
+      player.setMessageInterceptor(messages.MessageType.LOAD, function (req) {
+        if (selfInitiatedLoad) return req;
+
+        // Last-resort guard. CAF turns any throw out of this interceptor into
+        // error 905 ("connects to the TV, nothing plays"), which is an
+        // extremely misleading way to report a bug in our own UI code — so
+        // never let one escape: an undecorated request still plays.
+        try {
+          // A sender-initiated load resets the session context and any
+          // in-flight recovery/up-next state.
+          suppressHlsHints = false;
+          resetRecovery();
+          cancelUpNext();
+          applyCustomData(req.customData, req.media);
+          renderMeta("Loading");
+          setPhase("LOADING");
+          return normalizeLoad(req);
+        } catch (e) {
+          rlog("[R][load] interceptor failed, passing through:", String(e && e.message));
+          return req;
+        }
+      });
+
+      // ═══ [8] EPISODE QUEUE + RESOLUTION ══════════════════════════════
+      // Receiver-driven on purpose. A CAF queue of pre-resolved URLs is
+      // useless here: resolved stream URLs expire in minutes, so every item
+      // past the first would be dead on arrival, and CAF gives no hook to
+      // refresh one at play time. Doing it ourselves also means autoplay keeps
+      // working when the sender's tab is closed — which is the whole point.
+      var queueState = { loaded: false, promise: null };
+
+      function ensureQueue() {
+        if (queueState.loaded) return Promise.resolve(ctx.episodes);
+        if (queueState.promise) return queueState.promise;
+        if (!ctx.showId) {
+          queueState.loaded = true;
+          return Promise.resolve([]);
+        }
+
+        // Deliberately lazy — this runs shortly before the episode ends, not
+        // at load, so a 10-season show doesn't mean 10 serial fetches on a
+        // gen-1 the moment you press cast.
+        queueState.promise = fetchJsonRetry(
+          api("/api/shows/" + encodeURIComponent(ctx.showId))
+        )
+          .then(function (body) {
+            var seasons = get(get(body, "data", {}), "seasons", []);
+            if (!Array.isArray(seasons) || !seasons.length) return [];
+            return collectSeasons(seasons, 0, []);
+          })
+          .then(function (list) {
+            ctx.episodes = list.slice(0, MAX_EPISODES);
+            ctx.episodeIndex = indexOfEpisode(ctx.episodes, ctx.episodeId);
+            queueState.loaded = true;
+            queueState.promise = null;
+            rlog(
+              "[R][queue] fetched n=" + ctx.episodes.length,
+              "idx=" + ctx.episodeIndex
+            );
+            return ctx.episodes;
+          })
+          .catch(function (err) {
+            queueState.loaded = true;
+            queueState.promise = null;
+            if (err && err.status === 403) {
+              ctx.autoplayNext = false;
+              toast("Autoplay unavailable for this title");
+              rlog("[R][queue] 403 — autoplay disabled");
+            } else {
+              rlog("[R][queue] failed", String(err && err.message));
+            }
+            return [];
+          });
+
+        return queueState.promise;
+      }
+
+      // Walks seasons in order, stopping once it has the current episode plus
+      // at least one more after it. Mirrors renderEpisodes() in watch.js,
+      // including the `s{n}-e{n}` id fallback.
+      function collectSeasons(seasons, i, acc) {
+        if (i >= seasons.length || i >= MAX_SEASON_SCAN) {
+          return Promise.resolve(acc);
+        }
+        var season = seasons[i];
+        var sid = get(season, "id", "");
+        if (!sid) return collectSeasons(seasons, i + 1, acc);
+
+        return fetchJson(api("/api/seasons/" + encodeURIComponent(sid) + "/episodes"))
+          .then(function (body) {
+            var eps = get(body, "data", []);
+            if (Array.isArray(eps)) {
+              eps.forEach(function (ep) {
+                acc.push({
+                  id: str(ep.id, "") || "s" + season.number + "-e" + ep.number,
+                  sid: sid,
+                  s: get(season, "number", "?"),
+                  e: get(ep, "number", "?"),
+                  t: str(ep.title, "Episode")
+                });
+              });
+            }
+            return acc;
+          })
+          .catch(function (err) {
+            if (err && err.status === 403) throw err;
+            return acc;
+          })
+          .then(function () {
+            var found = indexOfEpisode(acc, ctx.episodeId);
+            // Stop as soon as we have the current episode and a successor.
+            if (found !== -1 && found < acc.length - 1) return acc;
+            return collectSeasons(seasons, i + 1, acc);
+          });
+      }
+
+      function nextEpisode() {
+        if (ctx.contentType !== "episode") return null;
+        if (ctx.episodeIndex < 0) return null;
+        return ctx.episodes[ctx.episodeIndex + 1] || null;
+      }
+
+      function episodeLabelOf(ep) {
+        if (!ep) return "";
+        return "S" + get(ep, "s", "?") + "E" + get(ep, "e", "?");
+      }
+
+      // Resolve a playable, proxy-wrapped stream for one episode/movie id.
+      // `serverOffset` rotates the server choice — a genuinely dead server
+      // never recovers by being retried.
+      function resolveStream(playbackId, contentType, serverOffset) {
+        var offset = serverOffset || 0;
+        var qs =
+          "/api/episodes/" +
+          encodeURIComponent(playbackId) +
+          "/servers?contentType=" +
+          encodeURIComponent(contentType);
+
+        return fetchJsonRetry(api(qs)).then(function (body) {
+          var servers = get(body, "data", []);
+          if (!Array.isArray(servers) || !servers.length) {
+            throw new Error("no servers");
+          }
+
+          // Mirror watch.js: prefer the server the sender was using, else the
+          // first one.
+          var base = 0;
+          if (ctx.serverName) {
+            for (var i = 0; i < servers.length; i++) {
+              var n = str(servers[i].name, "") || str(servers[i].server, "");
+              if (n === ctx.serverName) { base = i; break; }
+            }
+          }
+          var order = [];
+          for (var j = 0; j < servers.length; j++) {
+            order.push(servers[(base + offset + j) % servers.length]);
+          }
+          rlog(
+            "[R][queue] servers n=" + servers.length,
+            "pick=" + (str(order[0].name, "") || str(order[0].server, "?"))
+          );
+          return tryServers(playbackId, contentType, order, 0);
+        });
+      }
+
+      function tryServers(playbackId, contentType, order, i) {
+        if (i >= order.length || i >= 3) {
+          return Promise.reject(new Error("no server resolved"));
+        }
+        var qs =
+          "/api/episodes/" +
+          encodeURIComponent(playbackId) +
+          "/video?contentType=" +
+          encodeURIComponent(contentType);
+
+        return fetchJson(api(qs), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ server: order[i] })
+        })
+          .then(function (body) {
+            var data = get(body, "data", null);
+            // Same coalesce as buildPlayableUrl() in watch.js.
+            var raw =
+              str(get(data, "playlistUrl", ""), "") ||
+              str(get(data, "source", ""), "") ||
+              str(get(data, "url", ""), "");
+            // blob:/data:/inline manifests are local-only — a Chromecast has
+            // no way to fetch them.
+            if (!/^https?:\/\//i.test(raw)) throw new Error("unplayable source");
+            rlog("[R][queue] resolved " + safeUrl(raw));
+            return {
+              url: raw,
+              type: str(get(data, "type", ""), ""),
+              subtitles: get(data, "subtitles", null) || get(data, "captions", []),
+              serverName:
+                str(order[i].name, "") || str(order[i].server, "")
+            };
+          })
+          .catch(function (err) {
+            if (err && err.status === 403) throw err;
+            return tryServers(playbackId, contentType, order, i + 1);
+          });
+      }
+
+      // Builds and issues a LOAD from the receiver side. Goes through the same
+      // normalizeLoad() the interceptor uses, so a receiver-initiated load and
+      // a sender-initiated one can never diverge.
+      function loadStream(stream, positionSeconds) {
+        var media = new messages.MediaInformation();
+        media.contentId = proxied(stream.url);
+        media.contentUrl = media.contentId;
+        media.contentType = /^video\//i.test(stream.type || "")
+          ? stream.type
+          : "application/x-mpegurl";
+        media.streamType = messages.StreamType.BUFFERED;
+        media.metadata = buildMetadata();
+
+        if (Array.isArray(stream.subtitles) && stream.subtitles.length) {
+          ctx.subtitles = stream.subtitles.map(function (s) {
+            var srcUrl = str(s.url, "") || str(s.file, "") || str(s.src, "");
+            return {
+              label: s.label,
+              lang: s.lang,
+              url: srcUrl ? proxied(srcUrl) : "",
+              default: s.default || s.initialDefault
+            };
+          });
+        }
+
+        var req = new messages.LoadRequestData();
+        req.media = media;
+        req.autoplay = true;
+        req.currentTime = Math.max(0, Math.floor(num(positionSeconds, 0)));
+
+        normalizeLoad(req);
+        selfInitiatedLoad = true;
+        return player.load(req).then(
+          function (r) {
+            selfInitiatedLoad = false;
+            return r;
+          },
+          function (err) {
+            selfInitiatedLoad = false;
+            throw err;
+          }
+        );
+      }
+
+      // Switch to a specific episode from the queue (up-next, or a PLAY_EPISODE
+      // message from the sender's control panel).
+      //
+      // Set for the whole span of an episode change — from the decision to
+      // switch until the new stream is loaded (or has failed). Resolving takes
+      // a couple of seconds during which the *old* media is still playing out
+      // its last seconds, while ctx.episodeIndex already points at the new one:
+      // without this, the ticker's considerUpNext() sees "playing, near the
+      // end, nothing armed", arms the card for the episode *after* the one
+      // being loaded, and fires it seconds later — the player skips an episode.
+      // It cannot be cleared by a PLAYING media status, since those keep
+      // arriving for the outgoing stream; only the load settling clears it,
+      // with a deadline in the ticker so a load promise that never settles
+      // can't disable autoplay for the rest of the session.
+      var switching = false;
+      var switchingSince = 0;
+      var SWITCH_TIMEOUT_MS = 90000;
+
+      function playEpisodeAt(index, startAt) {
+        var ep = ctx.episodes[index];
+        if (!ep) return Promise.reject(new Error("no such episode"));
+
+        switching = true;
+        switchingSince = Date.now();
+        setPhase("RESOLVING");
+        ctx.episodeIndex = index;
+        ctx.episodeId = str(ep.id, "");
+        ctx.seasonId = str(ep.sid, "") || ctx.seasonId;
+        ctx.seasonNumber = num(ep.s, ctx.seasonNumber);
+        ctx.episodeNumber = num(ep.e, ctx.episodeNumber);
+        ctx.episodeTitle = str(ep.t, "");
+        ctx.episodeLabel = episodeLabelOf(ep);
+        ctx.contentType = "episode";
+        ctx.subtitles = [];
+        resetRecovery();
+        renderMeta("Up next");
+
+        broadcast({
+          type: "EPISODE_CHANGED",
+          episodeId: ctx.episodeId,
+          episodeIndex: index,
+          episodeLabel: ctx.episodeLabel,
+          seasonNumber: ctx.seasonNumber,
+          episodeNumber: ctx.episodeNumber,
+          title: ctx.episodeTitle
+        });
+
+        return resolveStream(ctx.episodeId, "episode", 0)
+          .then(function (stream) {
+            ctx.serverName = stream.serverName || ctx.serverName;
+            return loadStream(stream, startAt || 0);
+          })
+          .then(function () {
+            switching = false;
+          })
+          .catch(function (err) {
+            switching = false;
+            rlog("[R][queue] play failed", String(err && err.message));
+            showError(
+              "Couldn't start " + ctx.episodeLabel,
+              "No working server for this episode.",
+              err && err.status === 403 ? "403" : null
+            );
+          });
+      }
+
+      // ═══ [9] UP NEXT ═════════════════════════════════════════════════
+      var upNext = { armed: false, ep: null, firesAt: 0, prefetched: false };
+
+      function cancelUpNext() {
+        upNext = { armed: false, ep: null, firesAt: 0, prefetched: false };
+      }
+
+      function considerUpNext(current, duration) {
+        if (!duration || duration <= 0) return;
+        if (ctx.contentType !== "episode" || !ctx.autoplayNext) return;
+        if (!canResolve()) return;
+        // Only ever arm against media we are actually settled on. During an
+        // episode change or a recovery the player still reports the outgoing
+        // stream as PLAYING near its end, but ctx already describes the
+        // incoming episode — arming here queues the episode *after* the one
+        // being loaded and skips it.
+        if (switching || (phase !== "PLAYING" && phase !== "UPNEXT")) return;
+        var remaining = duration - current;
+
+        // Warm the queue a little before the card is due, so the "Up next"
+        // card can name the episode instead of showing a spinner.
+        if (!upNext.prefetched && remaining <= ctx.upNextSeconds + 20) {
+          upNext.prefetched = true;
+          ensureQueue().then(function () {
+            var ep = nextEpisode();
+            if (ep) rlog("[R][upnext] queue ready next=" + episodeLabelOf(ep));
+          });
+        }
+
+        if (upNext.armed || remaining > ctx.upNextSeconds) return;
+
+        var ep = nextEpisode();
+        if (!ep) return;
+
+        upNext.armed = true;
+        upNext.ep = ep;
+        upNext.firesAt = Date.now() + remaining * 1000;
+        el["un-label"].textContent = episodeLabelOf(ep);
+        el["un-title"].textContent = str(ep.t, "Next episode");
+        setPhase("UPNEXT");
+        rlog(
+          "[R][upnext] show ep=" + episodeLabelOf(ep),
+          "in=" + Math.round(remaining)
+        );
+        broadcast({
+          type: "UPNEXT",
+          episodeId: str(ep.id, ""),
+          label: episodeLabelOf(ep),
+          title: str(ep.t, ""),
+          secondsLeft: Math.round(remaining)
+        });
+      }
+
+      function tickUpNext() {
+        if (!upNext.armed) return;
+        var left = Math.max(0, (upNext.firesAt - Date.now()) / 1000);
+        el["un-count"].textContent =
+          left <= 0.5 ? "Playing next…" : "Playing next in " + Math.ceil(left);
+        var pct = ctx.upNextSeconds > 0 ? (left / ctx.upNextSeconds) * 100 : 0;
+        el["un-fill"].style.width = Math.max(0, Math.min(100, pct)) + "%";
+      }
+
+      function fireUpNext() {
+        if (!upNext.armed || !upNext.ep) return;
+        var ep = upNext.ep;
+        cancelUpNext();
+        rlog("[R][upnext] fire ep=" + episodeLabelOf(ep));
+        var idx = indexOfEpisode(ctx.episodes, str(ep.id, ""));
+        if (idx === -1) return;
+        playEpisodeAt(idx, 0);
+      }
+
+      // ═══ [10] RECOVERY / RE-RESOLVE ══════════════════════════════════
+      // Resolved stream URLs expire in minutes. Without this, a long pause or
+      // a slow episode ends as a black screen with error 905.
+      var RECOVERABLE = { 100: 1, 101: 1, 104: 1, 110: 1, 315: 1, 905: 1 };
+      // DetailedErrorCode.APP — a throw out of receiver code, not a media fault.
+      var APP_ERROR_CODE = 900;
+      var rr = { episodeId: "", n: 0, at: 0 };
+      var lastGoodPosition = 0;
+      var playingSince = 0;
+
+      function resetRecovery() {
+        rr = { episodeId: "", n: 0, at: 0 };
+        suppressHlsHints = false;
+      }
+
+      function recover(code) {
+        if (!canResolve()) {
+          showError(
+            "Playback stopped",
+            "Cast again from your phone or browser.",
+            code
+          );
+          return;
+        }
+
+        var playbackId = ctx.episodeId || ctx.showId;
+        if (rr.episodeId !== playbackId) rr = { episodeId: playbackId, n: 0, at: 0 };
+
+        var now = Date.now();
+        // Collapse error storms — CAF can fire ERROR several times per failure.
+        if (now - rr.at < 3000) return;
+        if (rr.n >= MAX_RECOVER_ATTEMPTS) {
+          showError(
+            "Stream unavailable",
+            "Tried " + MAX_RECOVER_ATTEMPTS + " servers without luck.",
+            code
+          );
+          return;
+        }
+
+        rr.n += 1;
+        rr.at = now;
+        var pos = lastGoodPosition;
+
+        // The TS/MPEG2_TS hints are set unconditionally on the first try; they
+        // are wrong for any fMP4/CMAF source, and a 315 is exactly that
+        // symptom. Drop them from the second attempt onwards.
+        suppressHlsHints = rr.n >= 2;
+
+        renderMeta("Reconnecting");
+        setPhase("RECOVERING");
+        rlog(
+          "[R][recover] code=" + code,
+          "attempt=" + rr.n,
+          "pos=" + Math.round(pos),
+          "hints=" + (suppressHlsHints ? "off" : "ts")
+        );
+        broadcast({ type: "RECOVERING", attempt: rr.n, positionSeconds: pos });
+
+        setTimeout(function () {
+          resolveStream(playbackId, ctx.contentType, rr.n)
+            .then(function (stream) {
+              ctx.serverName = stream.serverName || ctx.serverName;
+              return loadStream(stream, pos);
+            })
+            .catch(function (err) {
+              rlog("[R][recover] failed", String(err && err.message));
+              showError(
+                "Stream unavailable",
+                "Couldn't re-resolve this stream.",
+                err && err.status === 403 ? "403" : code
+              );
+            });
+        }, RECOVER_BACKOFF[rr.n - 1] || 5000);
+      }
+
+      // ═══ [11] CUSTOM NAMESPACE ═══════════════════════════════════════
+      // urn:x-cast:com.streamio.control — drives the sender's cast panel and
+      // tells it when the receiver advanced an episode on its own (so the page
+      // writes watch history against the right episode id).
+      // Both sides treat every message as advisory: a device may be running a
+      // cached older receiver, or a newer receiver than the page.
+      function broadcast(payload) {
+        try {
+          context.sendCustomMessage(NS, undefined, payload);
+        } catch {
+          /* no senders connected */
+        }
+      }
+
+      var lastBroadcast = 0;
+      function broadcastState() {
+        try {
+          broadcastStateUnsafe();
+        } catch (e) {
+          // setPhase() calls this from inside the LOAD interceptor, where much
+          // of the player API is still half-initialised. Telemetry for the
+          // sender's control panel must never be able to fail a load.
+          rlogThrottled("bstate", 10000, "[R][ns] state broadcast failed:", String(e && e.message));
+        }
+      }
+
+      function broadcastStateUnsafe() {
+        lastBroadcast = Date.now();
+        var media = player.getMediaInformation();
+        var tracks = (media && media.tracks) || [];
+        broadcast({
+          type: "STATE",
+          phase: phase,
+          provider: ctx.provider,
+          showId: ctx.showId,
+          showTitle: ctx.showTitle,
+          contentType: ctx.contentType,
+          episodeId: ctx.episodeId,
+          episodeIndex: ctx.episodeIndex,
+          episodeLabel: ctx.episodeLabel,
+          episodeTitle: ctx.episodeTitle,
+          positionSeconds: num(player.getCurrentTimeSec(), 0),
+          durationSeconds: num(player.getDurationSec(), 0),
+          playing: player.getPlayerState() === messages.PlayerState.PLAYING,
+          autoplayNext: ctx.autoplayNext,
+          subtitleTracks: tracks.map(function (t) {
+            return { id: t.trackId, name: t.name, lang: t.language };
+          }),
+          activeTrackId: (player.getMediaInformation() && activeTrackId()) || -1
+        });
+      }
+
+      // Both getTextTracksManager() and getActiveIds() throw ("Tracks info is
+      // not available.") whenever no media/track info is loaded yet — which is
+      // the normal state during the LOAD interceptor, where broadcastState()
+      // runs. An uncaught throw there is reported as an app error (900) and
+      // flashes the error card mid-load.
+      function activeTrackId() {
+        try {
+          if (!player.getTextTracksManager) return -1;
+          var ids = player.getTextTracksManager().getActiveIds();
+          return ids && ids.length ? ids[0] : -1;
+        } catch {
+          return -1;
+        }
+      }
+
+      context.addCustomMessageListener(NS, function (event) {
+        var data = event.data || {};
+        var type = str(data.type, "");
+        rlog("[R][ns] rx " + type);
+
+        if (type === "HELLO") {
+          broadcastState();
+        } else if (type === "SET_CONTEXT") {
+          applyCustomData(data.customData, player.getMediaInformation());
+          renderMeta("");
+          broadcastState();
+        } else if (type === "SET_QUEUE") {
+          if (Array.isArray(data.episodes)) {
+            ctx.episodes = data.episodes.slice(0, MAX_EPISODES);
+            ctx.episodeIndex = num(
+              data.episodeIndex,
+              indexOfEpisode(ctx.episodes, ctx.episodeId)
+            );
+            queueState = { loaded: true, promise: null };
+            rlog("[R][ns] queue set n=" + ctx.episodes.length);
+          }
+        } else if (type === "SET_AUTOPLAY") {
+          ctx.autoplayNext = data.enabled !== false;
+          if (!ctx.autoplayNext) cancelUpNext();
+          toast(ctx.autoplayNext ? "Autoplay on" : "Autoplay off");
+        } else if (type === "PLAY_EPISODE") {
+          var idx = num(data.index, -1);
+          if (idx < 0 && data.episodeId) {
+            idx = indexOfEpisode(ctx.episodes, str(data.episodeId, ""));
+          }
+          cancelUpNext();
+          if (idx >= 0) playEpisodeAt(idx, num(data.positionSeconds, 0));
+        } else if (type === "PLAY_NEXT_NOW") {
+          if (upNext.armed) fireUpNext();
+          else {
+            ensureQueue().then(function () {
+              var ep = nextEpisode();
+              if (ep) playEpisodeAt(ctx.episodeIndex + 1, 0);
+            });
+          }
+        } else if (type === "CANCEL_UPNEXT") {
+          cancelUpNext();
+          ctx.autoplayNext = false;
+          if (phase === "UPNEXT") setPhase("PLAYING");
+          toast("Autoplay off");
+        } else if (type === "SET_SUBTITLE") {
+          var trackId = num(data.trackId, -1);
+          try {
+            var ttm = player.getTextTracksManager();
+            if (trackId > 0) ttm.setActiveByIds([trackId]);
+            else ttm.setActiveByIds([]);
+            broadcastState();
+          } catch (e) {
+            rlog("[R][ns] subtitle switch failed", String(e && e.message));
+          }
+        }
+      });
+
+      // ═══ [12] PLAYER EVENTS + TICKER ═════════════════════════════════
+      player.addEventListener(cf.events.EventType.MEDIA_STATUS, function (event) {
+        var state = event.mediaStatus && event.mediaStatus.playerState;
+        var P = messages.PlayerState;
+
+        if (state === P.PLAYING) {
+          if (!playingSince) playingSince = Date.now();
+          if (phase !== "UPNEXT") {
+            if (phase !== "PLAYING") flashBar();
+            setPhase("PLAYING");
+          }
+        } else if (state === P.PAUSED) {
+          playingSince = 0;
+          if (phase !== "UPNEXT") {
+            renderMeta("Paused");
+            setPhase("PAUSED");
+          }
+        } else if (state === P.BUFFERING) {
+          playingSince = 0;
+          if (phase === "PLAYING") {
+            renderMeta("Buffering");
+            setPhase("LOADING");
+          }
+        } else if (state === P.IDLE) {
+          playingSince = 0;
+          if (phase !== "ERROR" && phase !== "RESOLVING" && phase !== "RECOVERING") {
+            setPhase("IDLE");
+          }
+        }
+      });
+
+      player.addEventListener(cf.events.EventType.ERROR, function (event) {
+        var code = num(event.detailedErrorCode, 0);
+        rlog("[R][error] code=" + code, str(event.reason, ""));
+
+        // 900 is APP: an exception escaped some receiver callback. It says
+        // nothing about the media — CAF raises it while a load that is
+        // perfectly healthy carries on to play — so tearing the UI down to an
+        // error card is wrong, and worse, it hides working playback behind a
+        // 5-second "Playback error". Log it (see the window error handler for
+        // the actual cause) and let the media speak for itself: if it really
+        // is dead, MEDIA_FINISHED/IDLE reports that on its own.
+        if (code === APP_ERROR_CODE) return;
+
+        if (RECOVERABLE[code]) recover(code);
+        else showError("Playback error", "This stream couldn't be played.", code);
+      });
+
+      player.addEventListener(cf.events.EventType.MEDIA_FINISHED, function (event) {
+        var reason = event.endedReason;
+        if (reason === messages.EndedReason.ERROR) {
+          rlog("[R][error] finished with error");
+          recover(905);
+          return;
+        }
+        if (reason === messages.EndedReason.END_OF_STREAM) {
+          // The outgoing stream reaches its end *after* an up-next fire has
+          // already started loading the next episode — ctx.episodeIndex is
+          // advanced by then, so advancing again here would skip an episode.
+          if (switching) return;
+          // Safety net: if the duration was unknown the up-next card never
+          // armed, so advance straight from the end of the stream.
+          if (upNext.armed) { fireUpNext(); return; }
+          if (ctx.autoplayNext && ctx.contentType === "episode" && canResolve()) {
+            ensureQueue().then(function () {
+              if (nextEpisode()) playEpisodeAt(ctx.episodeIndex + 1, 0);
+            });
+          }
+        }
+      });
+
+      // One timer for progress, up-next and state broadcasts. Three timers on
+      // a gen-1 is three times the wakeups for no benefit.
+      setInterval(function () {
+        var state = player.getPlayerState();
+        var playing = state === messages.PlayerState.PLAYING;
+        var current = num(player.getCurrentTimeSec(), 0);
+        var duration = num(player.getDurationSec(), 0) || ctx.durationSeconds || 0;
+
+        if ((playing || state === messages.PlayerState.PAUSED) && current > 0) {
+          lastGoodPosition = current;
+        }
+
+        // A stretch of healthy playback clears the recovery budget — three
+        // hiccups an hour apart must not be terminal.
+        if (playing && playingSince && Date.now() - playingSince > RECOVER_RESET_AFTER_MS) {
+          if (rr.n) rlog("[R][recover] budget reset after clean playback");
+          resetRecovery();
+        }
+
+        if (duration > 0) {
+          el["b-fill"].style.width =
+            Math.max(0, Math.min(100, (current / duration) * 100)) + "%";
+          el["b-duration"].textContent = clockTime(duration);
+        }
+        el["b-elapsed"].textContent = clockTime(current);
+
+        if (switching && Date.now() - switchingSince > SWITCH_TIMEOUT_MS) {
+          rlog("[R][queue] switch never settled — clearing guard");
+          switching = false;
+        }
+
+        if (playing) considerUpNext(current, duration);
+        tickUpNext();
+        if (upNext.armed && Date.now() >= upNext.firesAt) fireUpNext();
+
+        if (Date.now() - lastBroadcast >= STATE_BROADCAST_MS) broadcastState();
+      }, TICK_MS);
+
+      // ═══ [13] SUPPRESS THE BUILT-IN CHROME ═══════════════════════════
+      // <cast-media-player> is not just a video surface: its shadow DOM
+      // carries CAF's own TV overlay (poster, title, description AND a
+      // progress bar with time labels) inside <tv-overlay-placeholder>. It
+      // renders on top of the video, so with our overlay also drawing you get
+      // two progress bars and two time readouts stacked on each other.
+      //
+      // The shadow root is created with {mode:"open"}, so we can inject a
+      // stylesheet into it and hide the chrome while keeping the video.
+      // Structure (CAF 3.0.x):
+      //   #castPlayer > .background
+      //                 .foreground > video#castMediaElement, #logo,
+      //                               .spinner, #splash, #castSlideshowElement
+      //                 <tv-overlay-placeholder>
+      // Only the video and its caption container are kept — captions render
+      // into .shaka-text-container and must NOT be hidden.
+      //
+      // NOTE: on TV devices CAF *replaces* <tv-overlay-placeholder> with a
+      // real <tv-overlay> element once its module has loaded
+      // (`e.replaceChild(c, d)` in the framework). Hiding only the
+      // placeholder therefore does nothing by the time the overlay actually
+      // draws — both element names have to be covered.
+      var HIDE_CHROME_CSS =
+        "tv-overlay,tv-overlay-placeholder,#logo,#splash,.spinner," +
+        "#castSlideshowElement{display:none !important;}";
+
+      function hideDefaultChrome(attempt) {
+        var n = attempt || 0;
+        try {
+          var cmp = document.querySelector("cast-media-player");
+          var root = cmp && cmp.shadowRoot;
+          if (!root) {
+            // The element may not be upgraded yet on a slow device.
+            if (n < 10) setTimeout(function () { hideDefaultChrome(n + 1); }, 250);
+            else rlog("[R][ui] no shadowRoot — built-in chrome left visible");
+            return;
+          }
+          if (root.getElementById("streamio-hide-chrome")) return;
+          var style = document.createElement("style");
+          style.id = "streamio-hide-chrome";
+          style.textContent = HIDE_CHROME_CSS;
+          root.appendChild(style);
+          rlog("[R][ui] built-in chrome suppressed (attempt " + n + ")");
+        } catch (e) {
+          // Cosmetic only — never let this stop playback.
+          rlog("[R][ui] chrome suppression failed:", String(e && e.message));
+        }
+      }
+
+      hideDefaultChrome(0);
+
+      // ═══ [14] BOOT ═══════════════════════════════════════════════════
+      // Smart displays render their own touch controls under our overlay.
+      try {
+        var caps = context.getDeviceCapabilities();
+        if (caps && caps.touch_input_supported) {
+          el.ui.classList.add("touch");
+          rlog("[R][env] touch device — custom UI disabled");
+        }
+      } catch {
+        /* getDeviceCapabilities is not available on every CAF build */
+      }
+
+      // Feature detection. Anything logged as undefined here must already have
+      // a fallback path above — this is the file's early-warning system when
+      // the rolling CAF v3 channel changes under an old device.
+      rlog("[R][env] ua", navigator.userAgent);
+      rlog(
+        "[R][env] caf=" + str(cf.VERSION, "?"),
+        "hlsHints=" + typeof messages.HlsSegmentFormat,
+        "textTrackStyle=" + typeof messages.TextTrackStyle,
+        "abort=" + typeof AbortController,
+        "fromEntries=" + typeof Object.fromEntries,
+        "tracksMgr=" + typeof player.getTextTracksManager
+      );
+      // Enum names drift between CAF builds and reading a member off a missing
+      // one throws — which CAF reports as a 905, i.e. as "casting is broken".
+      // Log which ones this device actually has.
+      rlog(
+        "[R][env] enums",
+        "edgeType=" + typeof messages.TextTrackEdgeType,
+        "fontFamilyA=" + typeof messages.TextTrackFontGenericFamily,
+        "fontFamilyB=" + typeof messages.FontGenericFamily,
+        "image=" + typeof messages.Image,
+        "tvMeta=" + typeof messages.TvShowMediaMetadata,
+        "track=" + typeof messages.Track
+      );
+
+      try {
+        var options = new cf.CastReceiverOptions();
+        // The default 5-minute idle timeout would kill the session while the
+        // up-next card or an error card is on screen.
+        options.maxInactivity = 3600;
+        options.statusText = "Streamio";
+        options.supportedCommands =
+          messages.Command.SEEK |
+          messages.Command.PAUSE |
+          messages.Command.STREAM_VOLUME |
+          messages.Command.STREAM_MUTE |
+          messages.Command.SKIP_FORWARD |
+          messages.Command.SKIP_BACKWARD;
+
+        var pc = new cf.PlaybackConfig();
+        pc.segmentRequestRetryLimit = 3;
+        pc.manifestRequestRetryLimit = 3;
+        pc.autoResumeDuration = 5;
+        options.playbackConfig = pc;
+
+        context.start(options);
+        rlog("[Streamio CAF Receiver] ready (options)");
+      } catch (e) {
+        // Option fields vary between CAF builds — never let one unknown field
+        // stop the receiver from starting.
+        rlog("[R][env] options rejected", String(e && e.message));
+        context.start();
+        rlog("[Streamio CAF Receiver] ready (bare)");
+      }
+    </script>
+  </body>
+</html>

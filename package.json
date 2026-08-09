@@ -1,0 +1,15 @@
+{
+  "name": "streamio-cast-receiver",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Streamio's custom Google Cast (CAF v3) web receiver — a single static HTML file.",
+  "license": "ISC",
+  "type": "module",
+  "scripts": {
+    "check": "node scripts/check-compat.mjs",
+    "serve": "npx --yes serve ."
+  },
+  "devDependencies": {
+    "acorn": "^8.14.0"
+  }
+}
