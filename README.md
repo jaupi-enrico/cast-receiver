@@ -49,7 +49,7 @@ There is no build step. `index.html` is the deployment.
 ### The one hard rule: Chrome 70
 
 1st/2nd-gen Chromecasts run Chrome 70 (CrKey/1.36). Syntax they don't know is not a degraded
-feature — the HTML loads, the inline script never runs, and casting *silently does nothing* with
+feature — the HTML loads, the inline script never runs, and casting _silently does nothing_ with
 no error visible anywhere. Optional chaining (`?.`) and nullish coalescing (`??`) are the usual
 way this happens.
 
@@ -69,7 +69,7 @@ Push to `main`; Vercel builds nothing and serves `index.html` at `/` (`/receiver
 a rewrite in `vercel.json`).
 
 **The URL registered in the Cast console must be the production alias**,
-`https://cast-receiver-enrico08.vercel.app/` — *not* the per-deployment
+`https://cast-receiver-enrico08.vercel.app/` — _not_ the per-deployment
 `cast-receiver-<hash>-enrico08.vercel.app`, which changes on every push and would point the app id
 at a build that is about to go stale.
 
