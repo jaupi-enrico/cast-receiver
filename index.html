@@ -1549,10 +1549,23 @@
           durationSeconds: num(player.getDurationSec(), 0),
           playing: player.getPlayerState() === messages.PlayerState.PLAYING,
           autoplayNext: ctx.autoplayNext,
-          subtitleTracks: tracks.map(function (t) {
-            return { id: t.trackId, name: t.name, lang: t.language };
-          }),
-          activeTrackId: (player.getMediaInformation() && activeTrackId()) || -1
+          // TEXT only. MediaInformation.tracks is every track the load
+          // declared, and a sender that ever puts an audio track in there
+          // would otherwise have it listed as a subtitle.
+          subtitleTracks: tracks
+            .filter(function (t) {
+              return !t.type || t.type === messages.TrackType.TEXT;
+            })
+            .map(function (t) {
+              return { id: t.trackId, name: t.name, lang: t.language };
+            }),
+          activeTrackId: (player.getMediaInformation() && activeTrackId()) || -1,
+          // Audio renditions live inside the HLS manifest, not in
+          // MediaInformation.tracks, so they come from CAF's own manager
+          // rather than from anything the sender declared. Empty is a normal
+          // answer — see audioTracks().
+          audioTracks: audioTracks(),
+          activeAudioTrackId: activeAudioTrackId()
         });
       }
 
@@ -1566,6 +1579,38 @@
           if (!player.getTextTracksManager) return -1;
           var ids = player.getTextTracksManager().getActiveIds();
           return ids && ids.length ? ids[0] : -1;
+        } catch {
+          return -1;
+        }
+      }
+
+      // The audio equivalent, with one extra reason to be defensive: playback
+      // here is the device's *native* pipeline (see [7]), so whether CAF's JS
+      // layer can enumerate a manifest's audio renditions at all is a property
+      // of the device and the stream, not something this file can assume. An
+      // empty list is a supported answer — senders hide the control rather
+      // than showing an empty picker — and getAudioTracksManager() is itself
+      // absent on older CAF builds.
+      function audioTracks() {
+        try {
+          if (!player.getAudioTracksManager) return [];
+          var list = player.getAudioTracksManager().getTracks() || [];
+          return list.map(function (t) {
+            return {
+              id: t.trackId,
+              name: str(t.name, "") || str(t.language, "Audio"),
+              lang: str(t.language, "und")
+            };
+          });
+        } catch {
+          return [];
+        }
+      }
+
+      function activeAudioTrackId() {
+        try {
+          if (!player.getAudioTracksManager) return -1;
+          return num(player.getAudioTracksManager().getActiveId(), -1);
         } catch {
           return -1;
         }
@@ -1626,6 +1671,21 @@
           } catch (e) {
             rlog("[R][ns] subtitle switch failed", String(e && e.message));
           }
+        } else if (type === "SET_AUDIO_TRACK") {
+          // Either key works: a sender that read audioTracks out of a STATE
+          // has the id, while one that only knows the language it wants (or
+          // that is acting on a stale id after an episode change) can ask by
+          // language and let CAF match it.
+          var audioId = num(data.trackId, -1);
+          var lang = str(data.language, "");
+          try {
+            var atm = player.getAudioTracksManager();
+            if (audioId > 0) atm.setActiveById(audioId);
+            else if (lang) atm.setActiveByLanguage(lang);
+            broadcastState();
+          } catch (e) {
+            rlog("[R][ns] audio switch failed", String(e && e.message));
+          }
         }
       });
 
@@ -1640,6 +1700,16 @@
             if (phase !== "PLAYING") flashBar();
             setPhase("PLAYING");
           }
+          // Whether this device's native pipeline lets CAF see the manifest's
+          // audio renditions is the one thing SET_AUDIO_TRACK depends on and
+          // the one thing that can't be determined off-device. Log it once a
+          // minute so "the language picker never appears" is answerable.
+          rlogThrottled(
+            "atracks",
+            60000,
+            "[R][ns] audio tracks n=" + audioTracks().length,
+            "active=" + activeAudioTrackId()
+          );
         } else if (state === P.PAUSED) {
           playingSince = 0;
           if (phase !== "UPNEXT") {
