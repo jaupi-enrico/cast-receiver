@@ -1464,8 +1464,15 @@
           return;
         }
 
+        // NB: no `provider=` here — api() appends it (see [5]). Adding it
+        // twice sends the param doubled, which Express parses as an *array*;
+        // readIntroDbParams() in content.router.ts only accepts a string, so
+        // it falls back to provider "", and resolveIds() bails on an empty
+        // provider before it ever runs the title→TMDB match. The symptom is
+        // this endpoint answering `{"data":null}` for a title that resolves
+        // fine when asked once — i.e. a Skip button that never appears on the
+        // TV while the sender's own local one works.
         var qs = "type=" + (ctx.contentType === "movie" ? "movie" : "tv");
-        if (ctx.provider) qs += "&provider=" + encodeURIComponent(ctx.provider);
         if (ctx.showId) qs += "&showId=" + encodeURIComponent(ctx.showId);
         if (title) qs += "&title=" + encodeURIComponent(title);
         if (ctx.year) qs += "&year=" + encodeURIComponent(ctx.year);
@@ -1984,7 +1991,23 @@
         // with) — most TV remotes' physical Back button arrives this way,
         // not as Backspace/Escape.
         461: "Escape",
+        // 10009 is the same physical Back button on Tizen-derived remotes.
+        10009: "Escape",
         179: "MediaPlayPause"
+      };
+      // KeyboardEvent.key names that predate the current spec, or that TV
+      // firmwares emit instead of it. Normalized so the branches below only
+      // ever have to know the modern names.
+      var REMOTE_KEY_ALIASES = {
+        Left: "ArrowLeft",
+        Right: "ArrowRight",
+        Select: "Enter",
+        OK: "Enter",
+        Back: "Escape",
+        BrowserBack: "Escape",
+        GoBack: "Escape",
+        MediaPlay: "MediaPlayPause",
+        MediaPause: "MediaPlayPause"
       };
       var REMOTE_SEEK_STEP_SECONDS = 10;
 
@@ -2017,9 +2040,36 @@
         else if (upNext.armed) cancelUpNextFromRemote();
       }
 
+      // A key the platform has no name for arrives as the *string*
+      // "Unidentified", which is truthy — so `event.key || map[keyCode]` never
+      // reaches the map, and the keyCode table above was dead code. The keys
+      // that land here are exactly the ones the table exists for: a TV
+      // remote's Back and media buttons. Reject the placeholder explicitly.
+      function remoteKeyName(event) {
+        if (!event) return "";
+        var named = str(event.key, "");
+        if (named && named !== "Unidentified") {
+          return REMOTE_KEY_ALIASES[named] || named;
+        }
+        return REMOTE_KEY_CODES[num(event.keyCode, 0)] || "";
+      }
+
       function onRemoteKey(event) {
         if (event.repeat) return; // holding a key shouldn't repeat-fire
-        var key = (event && event.key) || REMOTE_KEY_CODES[event && event.keyCode] || "";
+        var key = remoteKeyName(event);
+
+        // What a given remote actually emits can't be determined off-device,
+        // and an unhandled key is silent by design — so log it. Throttled per
+        // key so a leaned-on D-pad can't flood the tunnel, and logged for
+        // unrecognized keys too: "which key is your Back button" is precisely
+        // the question this has to be able to answer.
+        rlogThrottled(
+          "remote:" + (key || "?" + num(event.keyCode, 0)),
+          2000,
+          "[R][remote] key=" + (key || "(unmapped)"),
+          "raw=" + str(event.key, "-"),
+          "code=" + num(event.keyCode, 0)
+        );
 
         try {
           if (key === "Enter" || key === " ") {
@@ -2041,7 +2091,13 @@
         }
       }
 
-      window.addEventListener("keydown", onRemoteKey);
+      // Capture phase, deliberately. The key event's target is whatever CAF
+      // has focused — normally inside <cast-media-player>'s shadow DOM — and
+      // a bubble-phase listener on window only ever sees a key no handler in
+      // between chose to stopPropagation(). Capture runs before the target's
+      // own handlers and cannot be cut off by them, so this is the only
+      // registration that reliably sees a remote's D-pad.
+      window.addEventListener("keydown", onRemoteKey, true);
 
       // ═══ [14] PLAYER EVENTS + TICKER ═════════════════════════════════
       player.addEventListener(cf.events.EventType.MEDIA_STATUS, function (event) {
