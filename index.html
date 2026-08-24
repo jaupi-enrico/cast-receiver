@@ -2099,6 +2099,87 @@
       // registration that reliably sees a remote's D-pad.
       window.addEventListener("keydown", onRemoteKey, true);
 
+      // ── The other remote path: CEC transport keys ─────────────────────
+      // On a Chromecast *dongle* the keydown path above is inert. The stick
+      // has no input hardware of its own, and an HDMI-CEC user-control
+      // message from the TV is translated by the platform into a Cast **media
+      // command**, never into a KeyboardEvent. That asymmetry is exactly what
+      // a Samsung remote on a gen-1 shows: play/pause works (PlayerManager
+      // handles it via options.supportedCommands in [16]) while OK/Back and
+      // the D-pad do nothing whatsoever, because nothing is delivered to the
+      // page to handle.
+      //
+      // So on that hardware the transport keys are the *only* remote input
+      // that exists, and they arrive here. Wiring them to the same actions
+      // OK/Back drive makes the on-screen Skip and Up Next prompts reachable
+      // on a device with no D-pad at all — otherwise the receiver draws a
+      // Skip button that physically cannot be pressed except from a sender.
+      //
+      // Which physical button produces which command is a property of the
+      // TV's CEC implementation and cannot be known off-device, so every
+      // command is logged. That log is how you find out what a given remote
+      // can actually drive.
+      function interceptCommand(typeName, handler) {
+        var type = messages.MessageType[typeName];
+        // Message types drift between CAF builds; an unknown one must be a
+        // no-op, not a throw at boot.
+        if (type === undefined) return;
+        try {
+          player.setMessageInterceptor(type, function (req) {
+            rlogThrottled("cmd:" + typeName, 1000, "[R][remote] cmd=" + typeName);
+            try {
+              // `false` means "handled here" — swallow the request so the
+              // player doesn't also act on it.
+              if (handler && handler(req) === false) return null;
+            } catch (e) {
+              rlog("[R][remote] cmd handler failed:", String(e && e.message));
+            }
+            return req;
+          });
+        } catch (e) {
+          rlog("[R][remote] cannot intercept " + typeName);
+        }
+      }
+
+      // Next/skip-ahead: same contract as OK/Select on a D-pad.
+      //
+      // Never falls through to the player. There is no CAF queue to advance —
+      // this receiver drives its own ([8]) — so a pass-through would be an
+      // invalid request against an empty queue, which CAF reports as a player
+      // error over a perfectly healthy stream. Every path here is terminal.
+      function onRemoteAdvance() {
+        if (activeSkipSegment) { performSkip(); return false; }
+        if (upNext.armed) { fireUpNext(); return false; }
+        if (ctx.contentType === "episode" && canResolve()) {
+          ensureQueue().then(function () {
+            if (nextEpisode()) playEpisodeAt(ctx.episodeIndex + 1, 0);
+          });
+        }
+        return false;
+      }
+
+      // Previous/back: same contract as Back on a D-pad. Terminal for the
+      // same reason as above — with nothing on screen this is a no-op, not a
+      // queue operation.
+      function onRemoteDismiss() {
+        if (activeSkipSegment) { dismissSkipSegment(); return false; }
+        if (upNext.armed) { cancelUpNextFromRemote(); return false; }
+        return false;
+      }
+
+      interceptCommand("QUEUE_NEXT", onRemoteAdvance);
+      interceptCommand("QUEUE_PREV", onRemoteDismiss);
+      interceptCommand("SKIP_AD", function () {
+        if (activeSkipSegment) { performSkip(); return false; }
+        return false; // no ad break exists here — never hand it to the player
+      });
+      // Pass-through, logged only — these already behave correctly on their
+      // own and exist here to identify which remote button sends what.
+      interceptCommand("PLAY", null);
+      interceptCommand("PAUSE", null);
+      interceptCommand("STOP", null);
+      interceptCommand("SEEK", null);
+
       // ═══ [14] PLAYER EVENTS + TICKER ═════════════════════════════════
       player.addEventListener(cf.events.EventType.MEDIA_STATUS, function (event) {
         var state = event.mediaStatus && event.mediaStatus.playerState;
@@ -2315,13 +2396,21 @@
         // up-next card or an error card is on screen.
         options.maxInactivity = 3600;
         options.statusText = "Streamio";
+        // QUEUE_NEXT/QUEUE_PREV are declared so a TV remote's ⏭/⏮ are routed
+        // to this receiver at all — the platform withholds a command the app
+        // doesn't claim to support, and on a dongle those buttons are the
+        // only way to reach the Skip/Up Next prompts (see [13]). An undefined
+        // member coerces to 0 in a bitwise OR, so an older CAF build that
+        // lacks one of these degrades to simply not offering it.
         options.supportedCommands =
           messages.Command.SEEK |
           messages.Command.PAUSE |
           messages.Command.STREAM_VOLUME |
           messages.Command.STREAM_MUTE |
           messages.Command.SKIP_FORWARD |
-          messages.Command.SKIP_BACKWARD;
+          messages.Command.SKIP_BACKWARD |
+          messages.Command.QUEUE_NEXT |
+          messages.Command.QUEUE_PREV;
 
         var pc = new cf.PlaybackConfig();
         pc.segmentRequestRetryLimit = 3;

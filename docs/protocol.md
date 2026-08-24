@@ -178,3 +178,20 @@ the rest of that segment, or cancels up-next — the same effect as the sender's
 Left/Right seek ±10s; a remote's own media play/pause key also toggles playback. None of this
 requires a Cast session at all — it works against the receiver directly, exactly like a real
 remote does.
+
+**The keydown path only exists on devices that have input hardware** — a Cast-enabled TV, an
+Android TV, a smart display. On a Chromecast **dongle** it is inert, and the distinction is not
+academic: the stick has no receiver of its own, and an HDMI-CEC user-control message from the TV
+is translated by the platform into a Cast *media command*, never into a `KeyboardEvent`. The
+observable signature is a TV remote whose play/pause works while OK/Back/D-pad do nothing at
+all — nothing is being delivered to the page for the section above to handle.
+
+So on a dongle the transport keys are the only remote input there is, and the receiver wires them
+to the same actions: **⏭ / next** activates whatever is on screen (skip the segment, play an armed
+up-next) and otherwise advances an episode, **⏮ / previous** dismisses it. `QUEUE_NEXT` and
+`QUEUE_PREV` are declared in `options.supportedCommands` for exactly this reason — the platform
+withholds a command the app doesn't claim — and both are terminal: this receiver drives its own
+queue ([8]), so a pass-through would be an invalid request against an empty CAF queue, which
+surfaces as a player error over a healthy stream. Every intercepted command is logged as
+`[R][remote] cmd=` because which physical button maps to which command is a property of the TV's
+CEC implementation and cannot be determined off-device.
