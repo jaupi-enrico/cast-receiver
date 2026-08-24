@@ -76,13 +76,14 @@ Namespace: **`urn:x-cast:com.streamio.control`**
 | `PLAY_NEXT_NOW` | — | Fires an armed up-next immediately, or resolves the next episode if none is armed. |
 | `CANCEL_UPNEXT` | — | Cancels the up-next **and** turns autoplay off. |
 | `SET_SUBTITLE` | `{ trackId }` | `trackId <= 0` clears all text tracks. |
+| `SET_AUDIO_TRACK` | `{ trackId }` or `{ language }` | Switches the audio rendition. `trackId` wins when both are present; `language` exists so a sender can ask for what it wants without holding an id that an episode change has invalidated. A no-op when the device can't enumerate the tracks — see `audioTracks` below. |
 | `SKIP_SEGMENT_NOW` | — | Runs the same action as pressing the on-screen Skip button (§5) if one is currently active; no-op otherwise. |
 
 ### Receiver → sender
 
 | Message | Payload |
 | --- | --- |
-| `STATE` | `phase`, `provider`, `showId`, `showTitle`, `contentType`, `episodeId`, `episodeIndex`, `episodeLabel`, `episodeTitle`, `positionSeconds`, `durationSeconds`, `playing`, `autoplayNext`, `subtitleTracks[{id,name,lang}]`, `activeTrackId`, `skipSegment`. Broadcast on every phase change, on every skip-segment show/hide, and every 5s while playing. |
+| `STATE` | `phase`, `provider`, `showId`, `showTitle`, `contentType`, `episodeId`, `episodeIndex`, `episodeLabel`, `episodeTitle`, `positionSeconds`, `durationSeconds`, `playing`, `autoplayNext`, `subtitleTracks[{id,name,lang}]`, `activeTrackId`, `audioTracks[{id,name,lang}]`, `activeAudioTrackId`, `skipSegment`. Broadcast on every phase change, on every skip-segment show/hide, and every 5s while playing. |
 | `EPISODE_CHANGED` | `episodeId`, `episodeIndex`, `episodeLabel`, `seasonNumber`, `episodeNumber`, `title` |
 | `UPNEXT` | `episodeId`, `label`, `title`, `secondsLeft` |
 | `RECOVERING` | `attempt`, `positionSeconds` |
@@ -90,6 +91,16 @@ Namespace: **`urn:x-cast:com.streamio.control`**
 
 `phase` is one of `IDLE`, `LOADING`, `RESOLVING`, `PLAYING`, `PAUSED`, `UPNEXT`, `RECOVERING`,
 `ERROR`.
+
+**`subtitleTracks` and `audioTracks` come from different places, and only one of them is
+guaranteed.** Subtitles are tracks the sender (or the receiver) declared on the LOAD, so they are
+always enumerable. Audio renditions live *inside* the HLS manifest and are read back from CAF's
+`AudioTracksManager` — but playback here is the device's native pipeline, so whether CAF's JS
+layer can see them at all is a property of the device and the stream. **`audioTracks: []` is a
+normal answer**: a sender must hide its language control rather than show an empty picker, and
+must tolerate the field being absent entirely (a Chromecast may be running a cached receiver
+older than this contract). The receiver logs the count once a minute while playing, so
+`[CAST-RECEIVER] audio tracks n=` in the backend's logs is how you tell the two apart.
 
 `skipSegment` is `null`, or `{ type, label, endMs, runsToEnd }` — `type` is one of `intro`, `recap`,
 `credits`, `preview`; `label` is the button text the receiver is showing ("Skip Intro", etc.).
