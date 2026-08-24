@@ -2158,24 +2158,33 @@
         return false;
       }
 
-      // Previous/back: same contract as Back on a D-pad. Terminal for the
-      // same reason as above — with nothing on screen this is a no-op, not a
-      // queue operation.
-      function onRemoteDismiss() {
-        if (activeSkipSegment) { dismissSkipSegment(); return false; }
-        if (upNext.armed) { cancelUpNextFromRemote(); return false; }
-        return false;
-      }
-
-      interceptCommand("QUEUE_NEXT", onRemoteAdvance);
-      interceptCommand("QUEUE_PREV", onRemoteDismiss);
-      interceptCommand("SKIP_AD", function () {
-        if (activeSkipSegment) { performSkip(); return false; }
-        return false; // no ad break exists here — never hand it to the player
+      // **PLAY is the only free gesture this hardware has.**
+      //
+      // Measured on a gen-1 behind a Samsung TV with Anynet+ on: the only
+      // commands that arrive from the remote at all are PLAY and PAUSE. ⏭/⏮,
+      // FF/REW and STOP produce nothing — the TV never sends them to the
+      // dongle — and QUEUE_NEXT/QUEUE_PREV are not interceptable message
+      // types in CAF, so they cannot be claimed even in principle. That is
+      // the entire input budget: two buttons.
+      //
+      // A PLAY pressed while playback is *already* playing is still
+      // delivered, and does nothing otherwise. So it doubles as OK/Select
+      // whenever there is something on screen to activate — press play again
+      // to take the Skip, or to start the next episode early.
+      //
+      // PAUSE is deliberately left alone. Pausing during an intro is a
+      // legitimate thing to want, and a remote with two working buttons
+      // cannot afford to have one of them mean something conditional.
+      interceptCommand("PLAY", function () {
+        if (player.getPlayerState() !== messages.PlayerState.PLAYING) return true;
+        if (activeSkipSegment || upNext.armed) return onRemoteAdvance();
+        return true;
       });
-      // Pass-through, logged only — these already behave correctly on their
-      // own and exist here to identify which remote button sends what.
-      interceptCommand("PLAY", null);
+
+      // Pass-through, logged only. None of these has ever been observed to
+      // arrive from a dongle's CEC remote — they are registered so that a
+      // device or TV which *does* send them shows up in the log rather than
+      // being silently unhandled.
       interceptCommand("PAUSE", null);
       interceptCommand("STOP", null);
       interceptCommand("SEEK", null);
@@ -2396,21 +2405,19 @@
         // up-next card or an error card is on screen.
         options.maxInactivity = 3600;
         options.statusText = "Streamio";
-        // QUEUE_NEXT/QUEUE_PREV are declared so a TV remote's ⏭/⏮ are routed
-        // to this receiver at all — the platform withholds a command the app
-        // doesn't claim to support, and on a dongle those buttons are the
-        // only way to reach the Skip/Up Next prompts (see [13]). An undefined
-        // member coerces to 0 in a bitwise OR, so an older CAF build that
-        // lacks one of these degrades to simply not offering it.
+        // QUEUE_NEXT/QUEUE_PREV are deliberately NOT declared. CAF refuses a
+        // message interceptor for either type ("[R][remote] cannot intercept
+        // QUEUE_NEXT" is what that looks like in the log), so claiming them
+        // would put next/previous controls in the phone's media notification
+        // that this receiver has no way to act on. It drives its own queue —
+        // see [8] and the CEC notes in [13].
         options.supportedCommands =
           messages.Command.SEEK |
           messages.Command.PAUSE |
           messages.Command.STREAM_VOLUME |
           messages.Command.STREAM_MUTE |
           messages.Command.SKIP_FORWARD |
-          messages.Command.SKIP_BACKWARD |
-          messages.Command.QUEUE_NEXT |
-          messages.Command.QUEUE_PREV;
+          messages.Command.SKIP_BACKWARD;
 
         var pc = new cf.PlaybackConfig();
         pc.segmentRequestRetryLimit = 3;

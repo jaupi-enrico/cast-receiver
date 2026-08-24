@@ -186,12 +186,18 @@ is translated by the platform into a Cast *media command*, never into a `Keyboar
 observable signature is a TV remote whose play/pause works while OK/Back/D-pad do nothing at
 all — nothing is being delivered to the page for the section above to handle.
 
-So on a dongle the transport keys are the only remote input there is, and the receiver wires them
-to the same actions: **⏭ / next** activates whatever is on screen (skip the segment, play an armed
-up-next) and otherwise advances an episode, **⏮ / previous** dismisses it. `QUEUE_NEXT` and
-`QUEUE_PREV` are declared in `options.supportedCommands` for exactly this reason — the platform
-withholds a command the app doesn't claim — and both are terminal: this receiver drives its own
-queue ([8]), so a pass-through would be an invalid request against an empty CAF queue, which
-surfaces as a player error over a healthy stream. Every intercepted command is logged as
-`[R][remote] cmd=` because which physical button maps to which command is a property of the TV's
-CEC implementation and cannot be determined off-device.
+So on a dongle the transport keys are the only remote input there is — and there are fewer of them
+than you would expect. Measured on a gen-1 behind a Samsung TV with Anynet+ on, **the only
+commands that arrive at all are `PLAY` and `PAUSE`.** ⏭/⏮, FF/REW and STOP send nothing to the
+dongle, and `QUEUE_NEXT`/`QUEUE_PREV` are not interceptable message types in CAF, so they cannot
+be claimed even in principle (attempting it logs `[R][remote] cannot intercept QUEUE_NEXT`); they
+are deliberately absent from `options.supportedCommands` so the phone's media notification doesn't
+grow controls the receiver has no way to act on.
+
+That leaves an input budget of two buttons, so the receiver overloads the one press that is
+otherwise wasted: **a `PLAY` received while playback is already playing acts as OK/Select** —
+it takes an active Skip, or starts an armed up-next early. `PAUSE` is deliberately left alone,
+since pausing during an intro is legitimate and a two-button remote can't afford a conditional
+button. Every intercepted command is logged as `[R][remote] cmd=`, because which physical button
+maps to which command is a property of the TV's CEC implementation and cannot be determined
+off-device.
