@@ -25,6 +25,7 @@ release across the three repos; removing or renaming one does.
 | `provider` | string | Sent as `?provider=` on API calls. Omitted entirely when empty, so the server picks its default — an empty `provider=` is not the same as no param. |
 | `contentType` | `"episode"` \| `"movie"` | `"episode"`. A movie gets no up-next; recovery still works. |
 | `showId`, `seasonId`, `episodeId` | string | Queue and recovery are disabled without `showId`/`episodeId`. |
+| `tmdbId`, `imdbId`, `year` | number / string / number | Hints for the receiver's own Skip Intro/Recap/Credits/Preview lookup (§5). Absent `tmdbId` is derived from `showId` itself when it looks like `movie-<id>`/`tv-<id>` (the `tmdb` family's wire shape); absent everything falls back to a title-only fuzzy match against `showTitle`. |
 | `showTitle`, `episodeTitle`, `episodeLabel`, `description` | string | Falls back to `MediaInformation.metadata` (`seriesTitle`, `title`, `season`/`episode`), then to `"Streamio"`. |
 | `poster`, `backdrop` | string (URL) | Falls back to `metadata.images[0].url`; the backdrop falls back to the poster. |
 | `seasonNumber`, `episodeNumber`, `durationSeconds` | number \| null | Cosmetic. |
@@ -53,6 +54,10 @@ Each URL is wrapped through `castProxyBase` before being handed to CAF.
 3. **No `showId`/`provider`** — metadata renders; queue and recovery are off.
 4. **`contentType: "movie"`** — no up-next; recovery still works.
 
+Skip Intro/Recap/Credits/Preview (§5) sits *outside* this ladder, deliberately looser than the
+queue: it only needs a usable `title` (from `customData.showTitle`, or the MediaInformation
+fallback in rung 1) or a `tmdbId`/`imdbId`, so it can still work when queue/recovery can't.
+
 ---
 
 ## 2. The control channel
@@ -71,12 +76,13 @@ Namespace: **`urn:x-cast:com.streamio.control`**
 | `PLAY_NEXT_NOW` | — | Fires an armed up-next immediately, or resolves the next episode if none is armed. |
 | `CANCEL_UPNEXT` | — | Cancels the up-next **and** turns autoplay off. |
 | `SET_SUBTITLE` | `{ trackId }` | `trackId <= 0` clears all text tracks. |
+| `SKIP_SEGMENT_NOW` | — | Runs the same action as pressing the on-screen Skip button (§5) if one is currently active; no-op otherwise. |
 
 ### Receiver → sender
 
 | Message | Payload |
 | --- | --- |
-| `STATE` | `phase`, `provider`, `showId`, `showTitle`, `contentType`, `episodeId`, `episodeIndex`, `episodeLabel`, `episodeTitle`, `positionSeconds`, `durationSeconds`, `playing`, `autoplayNext`, `subtitleTracks[{id,name,lang}]`, `activeTrackId`. Broadcast on every phase change and every 5s while playing. |
+| `STATE` | `phase`, `provider`, `showId`, `showTitle`, `contentType`, `episodeId`, `episodeIndex`, `episodeLabel`, `episodeTitle`, `positionSeconds`, `durationSeconds`, `playing`, `autoplayNext`, `subtitleTracks[{id,name,lang}]`, `activeTrackId`, `skipSegment`. Broadcast on every phase change, on every skip-segment show/hide, and every 5s while playing. |
 | `EPISODE_CHANGED` | `episodeId`, `episodeIndex`, `episodeLabel`, `seasonNumber`, `episodeNumber`, `title` |
 | `UPNEXT` | `episodeId`, `label`, `title`, `secondsLeft` |
 | `RECOVERING` | `attempt`, `positionSeconds` |
@@ -84,6 +90,12 @@ Namespace: **`urn:x-cast:com.streamio.control`**
 
 `phase` is one of `IDLE`, `LOADING`, `RESOLVING`, `PLAYING`, `PAUSED`, `UPNEXT`, `RECOVERING`,
 `ERROR`.
+
+`skipSegment` is `null`, or `{ type, label, endMs, runsToEnd }` — `type` is one of `intro`, `recap`,
+`credits`, `preview`; `label` is the button text the receiver is showing ("Skip Intro", etc.).
+Unlike every other `STATE` field, this one can also change *without* a phase change (it overlays
+`PLAYING`/`PAUSED`, see §5), which is why the receiver broadcasts on its own show/hide too instead
+of waiting for the next periodic tick.
 
 ---
 
@@ -103,6 +115,7 @@ All calls go to `apiBase`, with `?provider=` appended when a provider is known.
 | `POST /api/episodes/:id/video?contentType=` body `{server}` | Resolving a playable URL. The response is coalesced `playlistUrl \|\| source \|\| url`, same as `buildPlayableUrl()` in watch.js. Non-`http(s)` sources (`blob:`, `data:`) are rejected — a Chromecast can't fetch them. |
 | `GET /api/cast-proxy?url=` | Every media and subtitle URL. Never bypass it: several upstreams pin CORS to their own origin or require headers a page can't set. |
 | `GET /api/cast-log?ts=&msg=` | Remote logging — `[CAST-RECEIVER]` lines in the backend's container logs. A Chromecast has no visible console, so this is the primary way to diagnose "connects but won't play". |
+| `GET /api/intro-segments?...` | Skip Intro/Recap/Credits/Preview timestamps (§5), via [TheIntroDB](https://theintrodb.org). Provider-agnostic, ungated, fail-silent server-side — an unanswerable request just means no Skip button, never a blocked or delayed LOAD. |
 
 Two backend requirements follow from hosting this receiver on a separate origin:
 
@@ -123,3 +136,34 @@ Two backend requirements follow from hosting this receiver on a separate origin:
   this reason.
 - **`castProxyBase` must be absolute.** The receiver has no page origin to resolve a relative URL
   against.
+
+---
+
+## 5. Skip Intro/Recap/Credits/Preview and remote control
+
+The receiver fetches `/api/intro-segments` **itself**, the same way it fetches its own episode
+queue (§3) — deliberately, not by having a sender hand it the segments directly, so this keeps
+working for an episode the receiver advanced to on its own after the sender's tab/app is gone.
+`tmdbId`/`imdbId`/`year` in `customData` (§1) are hints only: absent `tmdbId` is derived from
+`showId` when it looks like the `tmdb` family's `movie-<id>`/`tv-<id>` shape, and absent everything
+falls back to a title-only fuzzy match — the same fallback both senders' own local Skip Intro
+lookups already use, and the same Redis-cached match `services/intro-db.service.ts` performs
+either way, so asking twice (once from a sender, once from the receiver) costs nothing extra on a
+cache hit.
+
+The Skip button overlays `PLAYING`/`PAUSED` directly rather than being a `phase` of its own (a
+`data-skip` attribute, alongside the existing transient info-bar/toast attributes) — it has to
+coexist with ordinary playback, not replace it. It is mutually exclusive with the up-next card:
+neither shows while the other is active. A `credits`/`preview` segment whose end "runs to the end
+of media" behaves like up-next's "play now" instead of seeking to the literal last frame.
+
+**Remote control.** The receiver listens for raw `keydown` events — the only way a physical TV
+remote's D-pad reaches a Cast receiver at all, since that hardware doesn't speak through the Cast
+media-command channel the way a remote's *dedicated* transport buttons do (those are already
+covered by `options.supportedCommands` and need no code here). OK/Select activates whatever is
+on screen (skips the active segment, or plays an armed up-next episode now) and otherwise toggles
+play/pause; Back dismisses whatever is on screen without acting on it (snoozes the skip prompt for
+the rest of that segment, or cancels up-next — the same effect as the sender's own `CANCEL_UPNEXT`);
+Left/Right seek ±10s; a remote's own media play/pause key also toggles playback. None of this
+requires a Cast session at all — it works against the receiver directly, exactly like a real
+remote does.

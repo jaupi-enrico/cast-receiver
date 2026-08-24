@@ -54,8 +54,9 @@ run the file, which only a device can answer — `npm run check` is the closest 
 Numbered sections, referred to by number in the comments: `[0]` constants, `[1]` remote logging,
 `[2]` ES-safe helpers, `[3]` DOM + phase, `[4]` session context (the `customData` contract),
 `[5]` API client, `[6]` proxy, `[7]` load normalization, `[8]` episode queue + resolution,
-`[9]` up next, `[10]` recovery / re-resolve, `[11]` custom namespace, `[12]` player events +
-ticker, `[13]` suppress the built-in chrome, `[14]` boot.
+`[9]` skip segments (TheIntroDB), `[10]` up next, `[11]` recovery / re-resolve, `[12]` custom
+namespace, `[13]` remote control (key input), `[14]` player events + ticker, `[15]` suppress the
+built-in chrome, `[16]` boot.
 
 ## Related repos
 

@@ -273,6 +273,35 @@
         transition: width 0.5s linear;
       }
 
+      /* ─── Skip Intro/Recap/Credits/Preview ─────────────────────────── */
+      #l-skip {
+        display: flex;
+        align-items: flex-end;
+        justify-content: flex-end;
+        padding: 0 70px 70px 70px;
+      }
+      #skip-btn {
+        /* The file's first genuinely clickable element — #ui above is
+           pointer-events:none, and pointer-events inherits, so this needs
+           its own override or nothing (mouse, touch-testing) can reach it.
+           The physical TV remote reaches it through key events instead ([13]). */
+        pointer-events: auto;
+        background: rgba(12, 12, 12, 0.92);
+        border: 1px solid rgba(255, 255, 255, 0.18);
+        border-radius: 6px;
+        padding: 16px 26px;
+        font: 700 20px/1 "Helvetica Neue", Arial, sans-serif;
+        color: #fff;
+        cursor: pointer;
+        box-shadow: 0 14px 40px rgba(0, 0, 0, 0.65);
+      }
+      #skip-btn:hover,
+      #skip-btn:focus {
+        background: #e50914;
+        border-color: #e50914;
+        outline: none;
+      }
+
       /* ─── Error ────────────────────────────────────────────────────── */
       #l-error {
         display: flex; flex-direction: column;
@@ -344,6 +373,10 @@
       /* PLAYING shows nothing at all, except the 4s transient info bar. */
       #ui[data-bar="1"] #l-bar { opacity: 1; }
       #ui[data-toast="1"] #l-toast { opacity: 1; }
+      /* Skip Intro/Recap/Credits/Preview — like the info bar, this overlays
+         PLAYING/PAUSED without being a phase of its own: [9] toggles this
+         attribute rather than setPhase(), so it can coexist with either. */
+      #ui[data-skip="1"] #l-skip { opacity: 1; }
 
       /* PAUSED originally hid the backdrop so the frozen video frame would
          show through — but #l-backdrop is an opaque black layer, so the frame
@@ -394,6 +427,10 @@
           <div id="un-count"></div>
           <div id="un-track"><div id="un-fill"></div></div>
         </div>
+      </div>
+
+      <div class="layer" id="l-skip">
+        <button id="skip-btn"></button>
       </div>
 
       <div class="layer" id="l-error">
@@ -570,13 +607,22 @@
         return (h > 0 ? h + ":" : "") + mm + ":" + ss;
       }
 
+      // Wire ids for TMDB content look like "tv-<tmdbId>"/"movie-<tmdbId>"
+      // (see core/providers/Tmdb.ts server-side) — the same regex both
+      // senders already run locally for their own Skip Intro lookup. Lets
+      // [9] resolve a tmdbId even when a sender predates that field.
+      function tmdbIdFromShowId(showId) {
+        var m = /^(?:movie|tv)-(\d+)/.exec(showId || "");
+        return m ? Number(m[1]) : null;
+      }
+
       // ═══ [3] DOM + PHASE ═════════════════════════════════════════════
       var el = {};
       [
         "ui", "bd-img", "m-poster", "m-kicker", "m-title", "m-sub", "m-desc",
         "m-spin", "b-fill", "b-elapsed", "b-duration", "un-label", "un-title",
         "un-count", "un-fill", "e-msg", "e-hint", "e-code", "t-text",
-        "idle-hint"
+        "idle-hint", "skip-btn"
       ].forEach(function (id) {
         el[id] = document.getElementById(id);
       });
@@ -683,6 +729,14 @@
           provider: "",
           contentType: "episode",
           showId: "",
+          // Skip Intro/Recap/Credits/Preview (TheIntroDB) hints. Optional —
+          // a sender that already resolved these for its own local lookup
+          // hands them over so the receiver doesn't have to; absent, the
+          // receiver derives tmdbId from showId itself and falls back to a
+          // title-only fuzzy match server-side. See [9].
+          tmdbId: null,
+          imdbId: "",
+          year: null,
           showTitle: "",
           description: "",
           poster: "",
@@ -722,6 +776,10 @@
           c.provider = str(cd.provider, "");
           c.contentType = cd.contentType === "movie" ? "movie" : "episode";
           c.showId = str(cd.showId, "");
+          c.tmdbId = num(cd.tmdbId, null);
+          if (!c.tmdbId) c.tmdbId = tmdbIdFromShowId(c.showId);
+          c.imdbId = str(cd.imdbId, "");
+          c.year = num(cd.year, null);
           c.showTitle = str(cd.showTitle, "");
           c.description = str(cd.description, "");
           c.poster = str(cd.poster, "");
@@ -1050,13 +1108,15 @@
         // never let one escape: an undecorated request still plays.
         try {
           // A sender-initiated load resets the session context and any
-          // in-flight recovery/up-next state.
+          // in-flight recovery/up-next/skip-segment state.
           suppressHlsHints = false;
           resetRecovery();
           cancelUpNext();
+          resetSkipSegmentState();
           applyCustomData(req.customData, req.media);
           renderMeta("Loading");
           setPhase("LOADING");
+          loadSkipSegments(); // fire-and-forget — see [9]
           return normalizeLoad(req);
         } catch (e) {
           rlog("[R][load] interceptor failed, passing through:", String(e && e.message));
@@ -1325,7 +1385,9 @@
         ctx.contentType = "episode";
         ctx.subtitles = [];
         resetRecovery();
+        resetSkipSegmentState();
         renderMeta("Up next");
+        loadSkipSegments(); // fire-and-forget — tmdbId/imdbId/year are show-level, carry over
 
         broadcast({
           type: "EPISODE_CHANGED",
@@ -1356,7 +1418,203 @@
           });
       }
 
-      // ═══ [9] UP NEXT ═════════════════════════════════════════════════
+      // ═══ [9] SKIP SEGMENTS (TheIntroDB) ══════════════════════════════
+      // Mirrors loadIntroSegments()/maybeShowSkipSegment()/
+      // findActiveSkipSegment() in watch.js. Run receiver-side, on purpose,
+      // for the same reason the episode queue is fetched receiver-side in
+      // [8]: this has to keep working for an episode the receiver advanced
+      // to on its own, after the sender's tab/app is long gone. tmdbId/
+      // imdbId/year in customData are hints, not requirements — see [4] and
+      // tmdbIdFromShowId() in [2].
+      var skipSegmentsCache = {};
+      var skipSegmentsInFlight = {};
+      var activeSkipSegment = null; // { type, start, end, runsToEnd } (ms)
+      var skipSnoozedUntilMs = -1; // set by a manual dismiss; -1 = not snoozed
+
+      function skipSegmentsCacheKey() {
+        return ctx.episodeId || ctx.showId || "";
+      }
+
+      // Called wherever ctx is (re)populated — LOAD, playEpisodeAt(), and
+      // SET_CONTEXT — so a new episode never inherits the previous one's
+      // on-screen prompt or dismissal snooze. Doesn't touch skipSegmentsCache:
+      // that's keyed per episode/show id already, so an id already fetched
+      // stays cached across a SET_CONTEXT that re-describes the same episode.
+      function resetSkipSegmentState() {
+        activeSkipSegment = null;
+        skipSnoozedUntilMs = -1;
+        el.ui.removeAttribute("data-skip");
+      }
+
+      function loadSkipSegments() {
+        var key = skipSegmentsCacheKey();
+        if (!key || Object.prototype.hasOwnProperty.call(skipSegmentsCache, key)) return;
+        if (skipSegmentsInFlight[key]) return;
+
+        // "Streamio" is blankCtx()'s literal placeholder, not a real title —
+        // sending it as a title param would ask TheIntroDB to match a show
+        // that doesn't exist.
+        var title = ctx.showTitle && ctx.showTitle !== "Streamio" ? ctx.showTitle : "";
+        if (!ctx.tmdbId && !ctx.imdbId && !title) {
+          skipSegmentsCache[key] = null;
+          return;
+        }
+        if (ctx.contentType === "episode" && (ctx.seasonNumber == null || ctx.episodeNumber == null)) {
+          skipSegmentsCache[key] = null; // no season/episode to ask with — 400s
+          return;
+        }
+
+        var qs = "type=" + (ctx.contentType === "movie" ? "movie" : "tv");
+        if (ctx.provider) qs += "&provider=" + encodeURIComponent(ctx.provider);
+        if (ctx.showId) qs += "&showId=" + encodeURIComponent(ctx.showId);
+        if (title) qs += "&title=" + encodeURIComponent(title);
+        if (ctx.year) qs += "&year=" + encodeURIComponent(ctx.year);
+        if (ctx.tmdbId) qs += "&tmdbId=" + encodeURIComponent(ctx.tmdbId);
+        if (ctx.imdbId) qs += "&imdbId=" + encodeURIComponent(ctx.imdbId);
+        if (ctx.contentType === "episode") {
+          qs += "&season=" + encodeURIComponent(ctx.seasonNumber);
+          qs += "&episode=" + encodeURIComponent(ctx.episodeNumber);
+        }
+        var durMs = Math.round(num(player.getDurationSec(), 0) * 1000) ||
+          Math.round(num(ctx.durationSeconds, 0) * 1000);
+        if (durMs > 0) qs += "&durationMs=" + durMs;
+
+        skipSegmentsInFlight[key] = true;
+        fetchJsonRetry(api("/api/intro-segments?" + qs))
+          .then(function (body) {
+            skipSegmentsCache[key] = get(body, "data", null) || null;
+            rlog("[R][skip] loaded", key, skipSegmentsCache[key] ? "yes" : "none");
+          })
+          .catch(function (err) {
+            skipSegmentsCache[key] = null; // fail silent — never blocks playback
+            rlog("[R][skip] load failed", String(err && err.message));
+          })
+          .then(function () {
+            delete skipSegmentsInFlight[key];
+          });
+      }
+
+      var SKIP_SEGMENT_LABELS = {
+        intro: "Skip Intro",
+        recap: "Skip Recap",
+        credits: "Skip Credits",
+        preview: "Skip Preview"
+      };
+
+      // Segments come from the "theintrodb" npm client, already normalized:
+      // startMs is always a number, endMs stays null to mean "runs to end of
+      // media" — same shape/priority order as watch.js's own
+      // findActiveSkipSegment().
+      function findActiveSkipSegment(data, tMs, durMs) {
+        function check(list, type) {
+          for (var i = 0; i < (list || []).length; i++) {
+            var seg = list[i];
+            var end = seg.endMs != null ? seg.endMs : durMs;
+            if (tMs >= seg.startMs && tMs < end) {
+              return { type: type, start: seg.startMs, end: end, runsToEnd: seg.endMs == null };
+            }
+          }
+          return null;
+        }
+        return (
+          check(data.intro, "intro") ||
+          check(data.recap, "recap") ||
+          check(data.credits, "credits") ||
+          check(data.preview, "preview")
+        );
+      }
+
+      // Shows/hides don't go through setPhase() — the prompt has to overlay
+      // PLAYING/PAUSED, not replace them (see the CSS `data-skip` rule) — so
+      // broadcastState() is called by hand here, the same reason setPhase()
+      // always calls it: without this, a sender's panel wouldn't learn a
+      // segment is active for up to STATE_BROADCAST_MS.
+      function showSkipSegment(match) {
+        activeSkipSegment = match;
+        el["skip-btn"].textContent = SKIP_SEGMENT_LABELS[match.type] || "Skip";
+        el.ui.setAttribute("data-skip", "1");
+        broadcastState();
+      }
+
+      function hideSkipSegment() {
+        if (!activeSkipSegment) return;
+        activeSkipSegment = null;
+        el.ui.removeAttribute("data-skip");
+        broadcastState();
+      }
+
+      function considerSkipSegment(current, duration) {
+        if (!duration || duration <= 0) return;
+        if (phase !== "PLAYING" && phase !== "PAUSED") {
+          if (activeSkipSegment) hideSkipSegment();
+          return;
+        }
+
+        var data = skipSegmentsCache[skipSegmentsCacheKey()];
+        if (!data) return;
+
+        var tMs = current * 1000;
+        var durMs = duration * 1000;
+        if (skipSnoozedUntilMs >= 0) {
+          if (tMs < skipSnoozedUntilMs) {
+            if (activeSkipSegment) hideSkipSegment();
+            return;
+          }
+          skipSnoozedUntilMs = -1;
+        }
+
+        var match = findActiveSkipSegment(data, tMs, durMs);
+        if (match) {
+          if (
+            !activeSkipSegment ||
+            activeSkipSegment.type !== match.type ||
+            activeSkipSegment.start !== match.start
+          ) {
+            showSkipSegment(match);
+          }
+        } else if (activeSkipSegment) {
+          hideSkipSegment();
+        }
+      }
+
+      // Back/Escape on the remote ([13]): hide without skipping, and don't
+      // show it again for the rest of this segment.
+      function dismissSkipSegment() {
+        if (!activeSkipSegment) return;
+        skipSnoozedUntilMs = activeSkipSegment.end;
+        hideSkipSegment();
+      }
+
+      // The actual skip: seeks past the segment, or — for a credits/preview
+      // that "runs to the end of media" — behaves like up-next's "play now"
+      // instead of just seeking to the literal last frame. Mirrors watch.js's
+      // skipSegmentBtn.onclick. Reached three ways: a click ([2c]'s pointer
+      // fallback), the OK/Select key ([13]), and a sender's SKIP_SEGMENT_NOW
+      // message ([12]).
+      function performSkip() {
+        if (!activeSkipSegment) return;
+        var seg = activeSkipSegment;
+        hideSkipSegment();
+
+        if ((seg.type === "credits" || seg.type === "preview") && seg.runsToEnd) {
+          if (ctx.contentType === "episode" && ctx.autoplayNext && canResolve()) {
+            ensureQueue().then(function () {
+              var ep = nextEpisode();
+              if (ep) playEpisodeAt(ctx.episodeIndex + 1, 0);
+              else player.seek(Math.max(0, Math.floor(player.getDurationSec())));
+            });
+          } else {
+            player.seek(Math.max(0, Math.floor(player.getDurationSec())));
+          }
+          return;
+        }
+
+        player.seek(Math.max(0, Math.floor(seg.end / 1000)));
+      }
+
+      el["skip-btn"].addEventListener("click", performSkip);
+
+      // ═══ [10] UP NEXT ════════════════════════════════════════════════
       var upNext = { armed: false, ep: null, firesAt: 0, prefetched: false };
 
       function cancelUpNext() {
@@ -1428,7 +1686,7 @@
         playEpisodeAt(idx, 0);
       }
 
-      // ═══ [10] RECOVERY / RE-RESOLVE ══════════════════════════════════
+      // ═══ [11] RECOVERY / RE-RESOLVE ══════════════════════════════════
       // Resolved stream URLs expire in minutes. Without this, a long pause or
       // a slow episode ends as a black screen with error 905.
       var RECOVERABLE = { 100: 1, 101: 1, 104: 1, 110: 1, 315: 1, 905: 1 };
@@ -1504,7 +1762,7 @@
         }, RECOVER_BACKOFF[rr.n - 1] || 5000);
       }
 
-      // ═══ [11] CUSTOM NAMESPACE ═══════════════════════════════════════
+      // ═══ [12] CUSTOM NAMESPACE ═══════════════════════════════════════
       // urn:x-cast:com.streamio.control — drives the sender's cast panel and
       // tells it when the receiver advanced an episode on its own (so the page
       // writes watch history against the right episode id).
@@ -1552,7 +1810,15 @@
           subtitleTracks: tracks.map(function (t) {
             return { id: t.trackId, name: t.name, lang: t.language };
           }),
-          activeTrackId: (player.getMediaInformation() && activeTrackId()) || -1
+          activeTrackId: (player.getMediaInformation() && activeTrackId()) || -1,
+          skipSegment: activeSkipSegment
+            ? {
+                type: activeSkipSegment.type,
+                label: SKIP_SEGMENT_LABELS[activeSkipSegment.type] || "Skip",
+                endMs: activeSkipSegment.end,
+                runsToEnd: activeSkipSegment.runsToEnd
+              }
+            : null
         });
       }
 
@@ -1579,8 +1845,10 @@
         if (type === "HELLO") {
           broadcastState();
         } else if (type === "SET_CONTEXT") {
+          resetSkipSegmentState();
           applyCustomData(data.customData, player.getMediaInformation());
           renderMeta("");
+          loadSkipSegments(); // fire-and-forget — see [9]
           broadcastState();
         } else if (type === "SET_QUEUE") {
           if (Array.isArray(data.episodes)) {
@@ -1612,10 +1880,7 @@
             });
           }
         } else if (type === "CANCEL_UPNEXT") {
-          cancelUpNext();
-          ctx.autoplayNext = false;
-          if (phase === "UPNEXT") setPhase("PLAYING");
-          toast("Autoplay off");
+          cancelUpNextFromRemote();
         } else if (type === "SET_SUBTITLE") {
           var trackId = num(data.trackId, -1);
           try {
@@ -1626,10 +1891,99 @@
           } catch (e) {
             rlog("[R][ns] subtitle switch failed", String(e && e.message));
           }
+        } else if (type === "SKIP_SEGMENT_NOW") {
+          performSkip();
         }
       });
 
-      // ═══ [12] PLAYER EVENTS + TICKER ═════════════════════════════════
+      // Shared by the CANCEL_UPNEXT message above and the Back key in [13] —
+      // the two must never drift, since both mean the same thing to the user.
+      function cancelUpNextFromRemote() {
+        cancelUpNext();
+        ctx.autoplayNext = false;
+        if (phase === "UPNEXT") setPhase("PLAYING");
+        toast("Autoplay off");
+      }
+
+      // ═══ [13] REMOTE CONTROL (KEY INPUT) ═════════════════════════════
+      // The file's first raw key handling. A physical TV remote's D-pad/OK/
+      // Back reach a Cast receiver as ordinary KeyboardEvents on the page,
+      // not through the Cast media-command channel — that channel only
+      // carries *dedicated* transport buttons (a remote's own play/pause/
+      // rewind keys), which the platform already turns into standard PAUSE/
+      // SEEK commands PlayerManager handles on its own (see
+      // options.supportedCommands in [16]). This section is additive to
+      // that, not a replacement for it. Every branch is wrapped in try/catch
+      // — a bad key event must never be able to take playback down, the same
+      // standard every other handler in this file holds itself to.
+      var REMOTE_KEY_CODES = {
+        13: "Enter", 32: " ", 37: "ArrowLeft", 39: "ArrowRight",
+        8: "Backspace", 27: "Escape",
+        // 461 is the cross-platform TV "Back" key code (HbbTV, and the
+        // Tizen/Samsung-adjacent remotes this device family shares ancestry
+        // with) — most TV remotes' physical Back button arrives this way,
+        // not as Backspace/Escape.
+        461: "Escape",
+        179: "MediaPlayPause"
+      };
+      var REMOTE_SEEK_STEP_SECONDS = 10;
+
+      function togglePlayPause() {
+        if (player.getPlayerState() === messages.PlayerState.PLAYING) player.pause();
+        else player.play();
+      }
+
+      function remoteSeekBy(seconds) {
+        var duration = num(player.getDurationSec(), 0);
+        if (!duration) return;
+        var target = num(player.getCurrentTimeSec(), 0) + seconds;
+        player.seek(Math.max(0, Math.min(duration, Math.floor(target))));
+      }
+
+      // OK/Select: activate whatever's on screen (skip the segment, or play
+      // the up-next episode now); with nothing on screen, toggle play/pause
+      // — useful on remotes with a D-pad but no dedicated transport buttons.
+      function onRemoteSelect() {
+        if (activeSkipSegment) performSkip();
+        else if (upNext.armed) fireUpNext();
+        else togglePlayPause();
+      }
+
+      // Back: dismiss whatever's on screen without acting on it (snooze the
+      // skip prompt, cancel autoplay-next) — mirrors what a sender's own
+      // dismiss control does, never a bare no-op while something is showing.
+      function onRemoteBack() {
+        if (activeSkipSegment) dismissSkipSegment();
+        else if (upNext.armed) cancelUpNextFromRemote();
+      }
+
+      function onRemoteKey(event) {
+        if (event.repeat) return; // holding a key shouldn't repeat-fire
+        var key = (event && event.key) || REMOTE_KEY_CODES[event && event.keyCode] || "";
+
+        try {
+          if (key === "Enter" || key === " ") {
+            onRemoteSelect();
+          } else if (key === "Backspace" || key === "Escape") {
+            onRemoteBack();
+          } else if (key === "ArrowLeft") {
+            remoteSeekBy(-REMOTE_SEEK_STEP_SECONDS);
+          } else if (key === "ArrowRight") {
+            remoteSeekBy(REMOTE_SEEK_STEP_SECONDS);
+          } else if (key === "MediaPlayPause" || key === "MediaPlay" || key === "MediaPause") {
+            togglePlayPause();
+          } else {
+            return; // not one of ours — leave it alone
+          }
+          event.preventDefault();
+        } catch (e) {
+          rlog("[R][remote] key handling failed:", String(e && e.message));
+        }
+      }
+
+      window.addEventListener("keydown", onRemoteKey);
+
+      // ═══ [14] PLAYER EVENTS + TICKER ═════════════════════════════════
       player.addEventListener(cf.events.EventType.MEDIA_STATUS, function (event) {
         var state = event.mediaStatus && event.mediaStatus.playerState;
         var P = messages.PlayerState;
@@ -1734,11 +2088,14 @@
         if (playing) considerUpNext(current, duration);
         tickUpNext();
         if (upNext.armed && Date.now() >= upNext.firesAt) fireUpNext();
+        // Unlike up-next, the skip prompt is also offered while PAUSED — a
+        // viewer who paused mid-intro should still see it on resume.
+        considerSkipSegment(current, duration);
 
         if (Date.now() - lastBroadcast >= STATE_BROADCAST_MS) broadcastState();
       }, TICK_MS);
 
-      // ═══ [13] SUPPRESS THE BUILT-IN CHROME ═══════════════════════════
+      // ═══ [15] SUPPRESS THE BUILT-IN CHROME ═══════════════════════════
       // <cast-media-player> is not just a video surface: its shadow DOM
       // carries CAF's own TV overlay (poster, title, description AND a
       // progress bar with time labels) inside <tv-overlay-placeholder>. It
@@ -1789,7 +2146,7 @@
 
       hideDefaultChrome(0);
 
-      // ═══ [14] BOOT ═══════════════════════════════════════════════════
+      // ═══ [16] BOOT ═══════════════════════════════════════════════════
       // Smart displays render their own touch controls under our overlay.
       try {
         var caps = context.getDeviceCapabilities();
