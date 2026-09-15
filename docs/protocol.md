@@ -147,6 +147,16 @@ Two backend requirements follow from hosting this receiver on a separate origin:
   this reason.
 - **`castProxyBase` must be absolute.** The receiver has no page origin to resolve a relative URL
   against.
+- **`MediaInformation.contentType` is `application/x-mpegurl`, lowercase.** CAF picks its
+  playback pipeline by looking the string up in its own table, and the lookup is case-sensitive.
+  The widely copied `application/x-mpegURL` spelling misses it: the manifest goes to the plain
+  media element, which cannot play a playlist, and the load fails ~13 seconds later as error
+  **100** (`MEDIA_UNKNOWN`) — after which every further load on that receiver page fails the same
+  way, so the recovery ladder burns all three attempts and the session ends on "Stream
+  unavailable". A progressive source is `video/mp4`, lowercase, for the same reason.
+  `normalizeLoad()` rewrites whatever a sender sends to the canonical spelling, so a sender that
+  gets it wrong is corrected rather than fatal — but senders must still send it correctly, since
+  a receiver deployment can be older than they are.
 
 ---
 

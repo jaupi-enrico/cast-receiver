@@ -41,6 +41,12 @@ run the file, which only a device can answer — `npm run check` is the closest 
   builds still installed on phones land there — not a hypothetical. **Every contract field stays
   optional**: adding one needs no coordinated release across the three repos, removing or
   renaming one does.
+- **The HLS content type is `application/x-mpegurl`, lowercase, everywhere.** CAF's
+  contentType → pipeline lookup is case-sensitive, so `application/x-mpegURL` is played as a
+  plain media file: error **100** ~13s into the load, and every later load on that page dies
+  with it (the recovery ladder then burns all three attempts on a stream that is fine).
+  `normalizeLoad()` rewrites whatever a sender sends — `HLS_CONTENT_TYPE` in `[0]` is the single
+  spelling this file will hand CAF.
 - **`castProxyBase` must match `CAST_PROXY_PREFIX`** in streamio-website's
   `routes/content.router.ts` character for character. The receiver has no page origin, so a
   mismatch means the master manifest loads and every single segment 404s.

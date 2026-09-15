@@ -470,6 +470,13 @@
       var MAX_RECOVER_ATTEMPTS = 3;
       var RECOVER_BACKOFF = [0, 2000, 5000];
       var RECOVER_RESET_AFTER_MS = 10000;
+      // The one spelling of the HLS content type this receiver will hand CAF.
+      // CAF's contentType → pipeline lookup is case-sensitive, so the common
+      // "application/x-mpegURL" spelling silently misses it and the stream is
+      // played as a plain media file (error 100). Every load — sender-issued
+      // or self-issued — goes through normalizeLoad(), which rewrites to this.
+      var HLS_CONTENT_TYPE = "application/x-mpegurl";
+
       var MAX_SEASON_SCAN = 20;
       var MAX_EPISODES = 500;
       var FETCH_TIMEOUT_MS = 8000;
@@ -936,11 +943,30 @@
         if (!media) return loadRequestData;
 
         var url = str(media.contentId, "") || str(media.contentUrl, "");
-        var type = str(media.contentType, "").toLowerCase();
+        // Kept as sent so the log can name a sender that used a spelling CAF
+        // would have rejected — that is the whole diagnosis of an error 100.
+        var sentType = str(media.contentType, "");
+        var type = sentType.toLowerCase();
 
-        // 1. Force the HLS content-type. The sender points at
-        //    /api/cast-proxy?url=... which has no file extension, so the
-        //    receiver can't infer the type on its own.
+        // 1. Force the HLS content-type, in ONE canonical spelling. The
+        //    sender points at /api/cast-proxy?url=... which has no file
+        //    extension, so the receiver can't infer the type on its own.
+        //
+        //    **The spelling is load-bearing, not cosmetic.** CAF matches
+        //    contentType against its own table to pick a pipeline, and the
+        //    match is case-sensitive: the widely-copied "application/
+        //    x-mpegURL" spelling misses it, so the manifest is handed to the
+        //    <video> element instead of the HLS player, Chrome 70 can't play
+        //    a playlist natively, and the load dies ~13s later as error 100
+        //    (MEDIA_UNKNOWN) — *after* which every further load in this page's
+        //    life fails the same way, so the recovery ladder burns all three
+        //    attempts and the session ends on "Stream unavailable".
+        //    Seen 2026-09-15: the Flutter sender sent x-mpegURL and failed,
+        //    the browser sender sent x-mpegurl and played the same stream on
+        //    the same device. Both senders send the lowercase form now, but
+        //    they are shipped separately and app builds already on phones are
+        //    not, so the receiver canonicalizes whatever it is handed and this
+        //    rewrite stays the authority.
         var looksHls =
           type.indexOf("mpegurl") !== -1 ||
           url.indexOf(".m3u8") !== -1 ||
@@ -949,8 +975,12 @@
 
         var looksProgressive = /\.(mp4|m4v|webm|mov)(\?|$)/i.test(url);
 
-        if (looksHls && !looksProgressive && type.indexOf("mpegurl") === -1) {
-          media.contentType = "application/x-mpegurl";
+        if (looksHls && !looksProgressive) {
+          media.contentType = HLS_CONTENT_TYPE;
+        } else if (type) {
+          // Progressive: keep the type but in the lowercase spelling, for the
+          // same reason ("Video/MP4" misses the table too).
+          media.contentType = type;
         }
 
         // 2. Declare the segment container formats explicitly.
@@ -1000,9 +1030,11 @@
           rlog("[R][load] non-fatal decoration failed:", String(e && e.message));
         }
 
+        var finalType = str(media.contentType, "(none)");
         rlog(
           "[R][load] url=" + safeUrl(url),
-          "type=" + str(media.contentType, "(none)"),
+          "type=" + finalType +
+            (sentType && sentType !== finalType ? " (sent " + sentType + ")" : ""),
           "tracks=" + ((media.tracks && media.tracks.length) || 0),
           "active=" + JSON.stringify(loadRequestData.activeTrackIds || []),
           "hints=" + (suppressHlsHints ? "off" : "ts")
@@ -1314,8 +1346,8 @@
         media.contentId = proxied(stream.url);
         media.contentUrl = media.contentId;
         media.contentType = /^video\//i.test(stream.type || "")
-          ? stream.type
-          : "application/x-mpegurl";
+          ? String(stream.type).toLowerCase()
+          : HLS_CONTENT_TYPE;
         media.streamType = messages.StreamType.BUFFERED;
         media.metadata = buildMetadata();
 
@@ -1725,9 +1757,15 @@
         // Collapse error storms — CAF can fire ERROR several times per failure.
         if (now - rr.at < 3000) return;
         if (rr.n >= MAX_RECOVER_ATTEMPTS) {
+          // Name the action that actually works. Once CAF's pipeline has gone
+          // bad, every load on this page can keep failing on a stream that is
+          // fine, and only a fresh receiver clears it — which is what stopping
+          // and re-casting does.
           showError(
             "Stream unavailable",
-            "Tried " + MAX_RECOVER_ATTEMPTS + " servers without luck.",
+            "Tried " +
+              MAX_RECOVER_ATTEMPTS +
+              " times without luck. Stop casting and cast again.",
             code
           );
           return;
@@ -1753,6 +1791,18 @@
         broadcast({ type: "RECOVERING", attempt: rr.n, positionSeconds: pos });
 
         setTimeout(function () {
+          // Tear the failed playback down before retrying. A load issued on
+          // top of a media element that has already errored is unreliable on
+          // gen-1/2 hardware: on 2026-09-15 all three retries reached PLAYING
+          // for a fraction of a second and died with the same code the first
+          // load did, while the very same stream played on the first try after
+          // the receiver was reloaded. maxInactivity is an hour (see [16]), so
+          // a stopped player can't take the session down with it.
+          try {
+            player.stop();
+          } catch (e) {
+            /* nothing loaded yet — the first load failed before it started */
+          }
           resolveStream(playbackId, ctx.contentType, rr.n)
             .then(function (stream) {
               ctx.serverName = stream.serverName || ctx.serverName;
