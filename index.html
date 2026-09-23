@@ -2563,6 +2563,15 @@
           messages.Command.SKIP_FORWARD |
           messages.Command.SKIP_BACKWARD;
 
+        // Keep HLS on MPL. The SDK switched its HLS default to Shaka in 2026
+        // and everything in this receiver — the TS segment hints, the 315
+        // handling — was built against MPL. On a gen-1 (Chrome 70, CAF
+        // 3.0.0156) Shaka fails these TS streams outright: Shaka error 3014
+        // (MEDIA_SOURCE_OPERATION_FAILED) with zero frames decoded, at 480p as
+        // well as 720p, on renditions canDisplayType accepts, while the
+        // segments arrive intact. Seen 2026-09-23; retries hit the same thing.
+        options.useShakaForHls = false;
+
         var pc = new cf.PlaybackConfig();
         pc.segmentRequestRetryLimit = 3;
         pc.manifestRequestRetryLimit = 3;
