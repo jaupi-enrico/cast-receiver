@@ -1143,6 +1143,7 @@
           // in-flight recovery/up-next/skip-segment state.
           suppressHlsHints = false;
           resetRecovery();
+          startPositionAt(req.currentTime);
           cancelUpNext();
           resetSkipSegmentState();
           applyCustomData(req.customData, req.media);
@@ -1417,6 +1418,7 @@
         ctx.contentType = "episode";
         ctx.subtitles = [];
         resetRecovery();
+        startPositionAt(startAt);
         resetSkipSegmentState();
         renderMeta("Up next");
         loadSkipSegments(); // fire-and-forget — tmdbId/imdbId/year are show-level, carry over
@@ -1740,6 +1742,16 @@
         suppressHlsHints = false;
       }
 
+      // A new title starts from its own offset, not wherever the previous one
+      // got to. resetRecovery() can't do this: it also runs mid-playback when
+      // the budget resets. Seen 2026-09-23: a movie cast right after an
+      // episode failed once and recovery reloaded it 20 minutes in, at the
+      // episode's position — and each later title inherited the one before.
+      function startPositionAt(seconds) {
+        lastGoodPosition = Math.max(0, num(seconds, 0));
+        playingSince = 0;
+      }
+
       function recover(code) {
         if (!canResolve()) {
           showError(
@@ -1809,7 +1821,7 @@
               return loadStream(stream, pos);
             })
             .catch(function (err) {
-              rlog("[R][recover] failed", String(err && err.message));
+              rlog("[R][recover] failed", describeFailure(err));
               showError(
                 "Stream unavailable",
                 "Couldn't re-resolve this stream.",
@@ -2280,9 +2292,91 @@
         }
       });
 
+      // What the player was doing when it failed. "code=100" with an empty
+      // reason (MEDIA_UNKNOWN) is all the ERROR event says on its own, and it
+      // can't tell a truncated segment from a rendition the device can't
+      // decode from the decoder running out of memory — the error object and
+      // the stats at that moment usually can.
+      function describeFailure(err) {
+        var out = {};
+        if (err && typeof err === "object") {
+          var keys = ["name", "message", "code", "detailedErrorCode", "reason",
+            "shakaErrorCode", "severity", "category"];
+          for (var i = 0; i < keys.length; i++) {
+            if (err[keys[i]] !== undefined && err[keys[i]] !== "") out[keys[i]] = err[keys[i]];
+          }
+          if (err.error && typeof err.error === "object") out.inner = describeFailure(err.error);
+          else if (err.error) out.inner = String(err.error);
+        } else if (err !== undefined) {
+          out.value = String(err);
+        }
+        return out;
+      }
+
+      function playbackStats() {
+        try {
+          var s = player.getStats() || {};
+          return {
+            w: s.width, h: s.height,
+            bw: s.streamBandwidth, est: s.estimatedBandwidth,
+            dropped: s.droppedFrames, decoded: s.decodedFrames,
+            t: Math.round(num(player.getCurrentTimeSec(), 0))
+          };
+        } catch (e) {
+          return { unavailable: String(e && e.message) };
+        }
+      }
+
+      if (cf.events.EventType.BITRATE_CHANGED) {
+        player.addEventListener(cf.events.EventType.BITRATE_CHANGED, function (event) {
+          var s = playbackStats();
+          rlogThrottled("bitrate", 2000, "[R][abr] bitrate=" + num(event.totalBitrate, 0),
+            "size=" + s.w + "x" + s.h);
+        });
+      }
+
+      // PlaybackConfig.manifestHandler — logs a master playlist's variants and
+      // whether this device claims it can decode each one. Returns the
+      // manifest untouched; see [16].
+      function logVariants(manifest) {
+        try {
+          if (typeof manifest !== "string" || manifest.indexOf("#EXT-X-STREAM-INF") === -1) {
+            return manifest;
+          }
+          var lines = manifest.split("\n");
+          var variants = [];
+          for (var i = 0; i < lines.length && variants.length < 12; i++) {
+            if (lines[i].indexOf("#EXT-X-STREAM-INF") !== 0) continue;
+            var attr = lines[i];
+            var bw = (/[:,]BANDWIDTH=(\d+)/.exec(attr) || [])[1] || "?";
+            var res = (/RESOLUTION=(\d+x\d+)/.exec(attr) || [])[1] || "";
+            var fps = (/FRAME-RATE=([\d.]+)/.exec(attr) || [])[1] || "";
+            var codecs = (/CODECS="([^"]*)"/.exec(attr) || [])[1] || "";
+            var ok = "?";
+            if (codecs && res) {
+              try {
+                var wh = res.split("x");
+                ok = context.canDisplayType("video/mp4", codecs,
+                  Number(wh[0]), Number(wh[1]), fps ? Number(fps) : undefined) ? "ok" : "NO";
+              } catch (e) { /* canDisplayType missing on this build */ }
+            }
+            variants.push(bw + "/" + (res || "-") + (fps ? "@" + fps : "") +
+              "/" + (codecs || "-") + "/" + ok);
+          }
+          var audio = manifest.split("TYPE=AUDIO").length - 1;
+          rlog("[R][variants]", variants.join(" "), "audioRenditions=" + audio);
+        } catch (e) {
+          /* diagnostics only — never let it touch the manifest */
+        }
+        return manifest;
+      }
+
       player.addEventListener(cf.events.EventType.ERROR, function (event) {
         var code = num(event.detailedErrorCode, 0);
         rlog("[R][error] code=" + code, str(event.reason, ""));
+        if (code !== APP_ERROR_CODE) {
+          rlog("[R][error] detail", describeFailure(event.error), playbackStats());
+        }
 
         // 900 is APP: an exception escaped some receiver callback. It says
         // nothing about the media — CAF raises it while a load that is
@@ -2473,6 +2567,7 @@
         pc.segmentRequestRetryLimit = 3;
         pc.manifestRequestRetryLimit = 3;
         pc.autoResumeDuration = 5;
+        pc.manifestHandler = logVariants;
         options.playbackConfig = pc;
 
         context.start(options);
